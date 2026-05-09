@@ -1268,82 +1268,97 @@
 
     // ── Hook playSong ──
     function installHooks() {
-        if (wired) return;
+        const hookState = window.__slopsmithStemsHooks || (window.__slopsmithStemsHooks = {});
+        hookState.impl = {
+            beforePlaySong(f) {
+                teardown(); // kill any prior graph before new song loads
+                currentFilename = f;
+            },
+            afterPlaySong(f) {
+                // Three independent paths to fire onSongReady, all protected
+                // by `handled` so we only build the graph once. Three paths
+                // because the wrapper chain can lose either the synchronous
+                // fast-path OR the _onReady hook depending on timing:
+                //
+                //   (1) _onReady hook — normal path.
+                //   (2) Synchronous fast-path — info.title AND info.stems are
+                //       already there when our wrapper resumes.
+                //   (3) Poll fallback — covers the race where 'ready' fires
+                //       AFTER inner wrappers' awaits resolved but BEFORE we
+                //       reach this post-await code.
+                const myFile = f;
+                let handled = false;
+                const fire = () => {
+                    if (handled) return;
+                    if (currentFilename !== myFile) return;
+                    handled = true;
+                    Promise.resolve()
+                        .then(() => onSongReady())
+                        .catch((e) => console.warn('[stems] init failed:', e));
+                };
+                const prev = highway._onReady;
+                const readyFn = () => {
+                    fire();
+                    if (prev) prev();
+                    if (highway._onReady === readyFn) highway._onReady = null;
+                };
+                highway._onReady = readyFn;
+
+                const infoNow = highway.getSongInfo && highway.getSongInfo();
+                if (infoNow && infoNow.title && Array.isArray(infoNow.stems)) {
+                    highway._onReady = null;
+                    fire();
+                    if (prev) prev();
+                } else {
+                    let attempts = 0;
+                    let myHandle;
+                    myHandle = setInterval(() => {
+                        attempts++;
+                        if (handled || currentFilename !== myFile || attempts >= 30) {
+                            clearInterval(myHandle);
+                            if (pollHandle === myHandle) pollHandle = null;
+                            return;
+                        }
+                        const info = highway.getSongInfo && highway.getSongInfo();
+                        if (info && info.title && Array.isArray(info.stems)) {
+                            clearInterval(myHandle);
+                            if (pollHandle === myHandle) pollHandle = null;
+                            if (!handled) {
+                                if (highway._onReady === readyFn) highway._onReady = null;
+                                fire();
+                                if (prev) prev();
+                            }
+                        }
+                    }, 200);
+                    pollHandle = myHandle;
+                }
+            },
+            teardown,
+        };
+        if (hookState.installed) return;
         wired = true;
+        hookState.installed = true;
 
         installAudioShims();
         exposeStemsGlobals();
 
         const _play = window.playSong;
+        hookState.basePlaySong = _play;
         window.playSong = async function (f, a) {
-            teardown(); // kill any prior graph before new song loads
-            currentFilename = f;
-            await _play(f, a);
-
-            // Three independent paths to fire onSongReady, all protected
-            // by `handled` so we only build the graph once. Three paths
-            // because the wrapper chain can lose either the synchronous
-            // fast-path OR the _onReady hook depending on timing:
-            //
-            //   (1) _onReady hook — normal path.
-            //   (2) Synchronous fast-path — info.title AND info.stems are
-            //       already there when our wrapper resumes.
-            //   (3) Poll fallback — covers the race where 'ready' fires
-            //       AFTER inner wrappers' awaits resolved but BEFORE we
-            //       reach this post-await code.
-            const myFile = f;
-            let handled = false;
-            const fire = () => {
-                if (handled) return;
-                if (currentFilename !== myFile) return;
-                handled = true;
-                Promise.resolve()
-                    .then(() => onSongReady())
-                    .catch((e) => console.warn('[stems] init failed:', e));
-            };
-            const prev = highway._onReady;
-            const readyFn = () => {
-                fire();
-                if (prev) prev();
-                if (highway._onReady === readyFn) highway._onReady = null;
-            };
-            highway._onReady = readyFn;
-
-            const infoNow = highway.getSongInfo && highway.getSongInfo();
-            if (infoNow && infoNow.title && Array.isArray(infoNow.stems)) {
-                highway._onReady = null;
-                fire();
-                if (prev) prev();
-            } else {
-                let attempts = 0;
-                let myHandle;
-                myHandle = setInterval(() => {
-                    attempts++;
-                    if (handled || currentFilename !== myFile || attempts >= 30) {
-                        clearInterval(myHandle);
-                        if (pollHandle === myHandle) pollHandle = null;
-                        return;
-                    }
-                    const i = highway.getSongInfo && highway.getSongInfo();
-                    if (i && i.title && Array.isArray(i.stems)) {
-                        clearInterval(myHandle);
-                        if (pollHandle === myHandle) pollHandle = null;
-                        if (!handled) {
-                            if (highway._onReady === readyFn) highway._onReady = null;
-                            fire();
-                            if (prev) prev();
-                        }
-                    }
-                }, 200);
-                pollHandle = myHandle;
-            }
+            const beforeImpl = hookState.impl;
+            if (beforeImpl && typeof beforeImpl.beforePlaySong === 'function') beforeImpl.beforePlaySong(f, a);
+            await hookState.basePlaySong.call(this, f, a);
+            const afterImpl = hookState.impl;
+            if (afterImpl && typeof afterImpl.afterPlaySong === 'function') afterImpl.afterPlaySong(f, a);
         };
 
         // Clean up on leaving the player
         const _show = window.showScreen;
+        hookState.baseShowScreen = _show;
         window.showScreen = function (id) {
-            if (id !== 'player') teardown();
-            return _show(id);
+            const impl = hookState.impl;
+            if (id !== 'player' && impl && typeof impl.teardown === 'function') impl.teardown();
+            return hookState.baseShowScreen.call(this, id);
         };
     }
 
