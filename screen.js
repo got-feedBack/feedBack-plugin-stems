@@ -121,6 +121,7 @@
     // abandoned (new song, or leaving the player).
     let pollHandle = null;
     const pointerCleanupHandlers = new Set();
+    const claimSnapshots = new Map();  // claimId:stemId -> previous session-only state
 
     // ── Transport state ──
     // The buffer transport replaces the 6 HTMLMediaElement decoder clocks.
@@ -740,6 +741,7 @@
             s.buffer = null;
         }
         stemState = [];
+        claimSnapshots.clear();
         transport.playing = false;
         transport.baseOffset = 0;
         transport.baseCtxTime = 0;
@@ -945,6 +947,7 @@
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
                 saveMuted(currentFilename, stemState);
+                recordStemUserOverride(s, 'User toggled Stems mute');
             };
             setStemVolume(s, s.vol, { persist: false });
             wrap.appendChild(btn);
@@ -1185,7 +1188,7 @@
         teardown();
         const info = highway.getSongInfo && highway.getSongInfo();
         const stems = (info && info.stems) || [];
-        if (stems.length === 0) return; // archive or stem-less sloppak — do nothing
+        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0 }); return; } // archive or stem-less sloppak — do nothing
 
         ensureCtx();
         // Decide per-song whether the pitch-preserving worklet is available.
@@ -1262,6 +1265,7 @@
         injectUI();
         installSongFaderBridge();
         buffersReady = true;
+        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
 
         if (pendingPlay) { pendingPlay = false; transportPlay(); }
     }
@@ -1369,6 +1373,148 @@
         return Boolean(v);
     }
 
+    function capabilityApi() {
+        return window.slopsmith && window.slopsmith.capabilities;
+    }
+
+    function isGuitarStemId(id) {
+        return /(^|[-_\s])(guitars?|rhythm|lead|dist|distortion)([-_\s]|$)/i.test(String(id || ''));
+    }
+
+    function applyStemState(stem, on, vol = stem.vol) {
+        stem.vol = Math.max(0, Math.min(1, Number.isFinite(Number(vol)) ? Number(vol) : stem.vol));
+        stem.on = !!on;
+        stem.gain.gain.value = stem.on ? stem.vol : 0;
+        if (stem.btn) stem.btn.className = stem.on ? ON_CLASS : OFF_CLASS;
+    }
+
+    function emitStemsState(event, payload = {}) {
+        const detail = { event, filename: currentFilename, ...payload };
+        try { window.dispatchEvent(new CustomEvent('stems:state', { detail })); } catch (_) {}
+        const api = capabilityApi();
+        if (api && typeof api.emitEvent === 'function') {
+            api.emitEvent('stems', event === 'provider-ready' ? 'stems.ready' : event, detail);
+        }
+    }
+
+    function stemSelector(stem) {
+        return isGuitarStemId(stem && stem.id) ? 'guitar' : String(stem && stem.id || '*').toLowerCase();
+    }
+
+    function recordStemUserOverride(stem, reason) {
+        const api = capabilityApi();
+        if (!api || typeof api.recordUserOverride !== 'function') return;
+        api.recordUserOverride({
+            capability: 'stems',
+            command: 'mute',
+            source: 'user',
+            target: { id: stem.id, kind: stemSelector(stem) },
+            selector: stemSelector(stem),
+            reason,
+        });
+        if (typeof api.emitEvent === 'function') api.emitEvent('stems', 'stems.manual-unmute', { id: stem.id, on: stem.on, filename: currentFilename });
+    }
+
+    function capabilityTargets(payload = {}) {
+        if (!stemState.length) return [];
+        const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+        const id = payload.id || target.id;
+        if (id) return stemState.filter(s => s.id.toLowerCase() === String(id).toLowerCase());
+        const selector = String(payload.selector || target.selector || target.kind || '').toLowerCase();
+        if (selector === 'guitar') {
+            const guitars = stemState.filter(s => isGuitarStemId(s.id));
+            return guitars.length ? guitars : stemState.filter(s => String(s.id).toLowerCase() === 'other');
+        }
+        return stemState.slice();
+    }
+
+    function claimIdFromContext(ctx) {
+        const payload = ctx && ctx.payload && typeof ctx.payload === 'object' ? ctx.payload : {};
+        const claim = ctx && ctx.claim && typeof ctx.claim === 'object' ? ctx.claim : {};
+        return payload.claimId || claim.claimId || null;
+    }
+
+    function capMute(ctx = {}) {
+        const payload = ctx.payload || {};
+        const claimId = claimIdFromContext(ctx);
+        const mutedIds = [];
+        for (const stem of capabilityTargets(payload)) {
+            if (claimId) {
+                const key = `${claimId}:${stem.id}`;
+                if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol, filename: currentFilename });
+            }
+            applyStemState(stem, false, stem.vol);
+            mutedIds.push(stem.id);
+        }
+        return { outcome: 'handled', payload: { claimId, mutedIds, filename: currentFilename } };
+    }
+
+    function capRestore(ctx = {}) {
+        const claimId = claimIdFromContext(ctx);
+        const restoredIds = [];
+        for (const [key, previous] of Array.from(claimSnapshots.entries())) {
+            if (claimId && previous.claimId !== claimId) continue;
+            const stem = stemState.find(s => s.id === previous.id);
+            if (stem) {
+                applyStemState(stem, previous.prevOn, previous.prevVol);
+                restoredIds.push(stem.id);
+            }
+            claimSnapshots.delete(key);
+        }
+        return { outcome: 'handled', payload: { claimId, restoredIds, filename: currentFilename } };
+    }
+
+    function clearClaimSnapshots(claimId) {
+        if (!claimId) return;
+        for (const [key, previous] of Array.from(claimSnapshots.entries())) {
+            if (previous.claimId === claimId) claimSnapshots.delete(key);
+        }
+    }
+
+    function capSetVolume(ctx = {}) {
+        const payload = ctx.payload || {};
+        stemsApi.setVolume(payload.id || payload.target?.id, payload.vol ?? payload.volume);
+        return { outcome: 'handled', payload: capList().payload };
+    }
+
+    function capList() {
+        return { outcome: 'handled', payload: { filename: currentFilename, stems: stemsApi.getState().map(s => ({ id: s.id, vol: s.vol, on: s.on })) } };
+    }
+
+    function capInspect() {
+        return { outcome: 'handled', payload: { filename: currentFilename, activeClaims: Array.from(claimSnapshots.values()), stems: capList().payload.stems } };
+    }
+
+    function installCapabilityParticipant() {
+        const api = capabilityApi();
+        if (!api || typeof api.registerParticipant !== 'function') {
+            window.addEventListener('slopsmith:capabilities:ready', installCapabilityParticipant, { once: true });
+            return;
+        }
+        api.registerParticipant('stems', {
+            stems: {
+                roles: ['owner', 'provider'],
+                commands: ['mute', 'restore', 'setVolume', 'list', 'inspect', 'mute-guitar', 'unmute-guitar'],
+                events: ['stems.ready', 'stems.mute-requested', 'stems.manual-unmute', 'claim:created', 'claim:released'],
+                compatibility: 'legacy-window-shim',
+                runtime: true,
+                handlers: {
+                    mute: capMute,
+                    restore: capRestore,
+                    setVolume: capSetVolume,
+                    list: capList,
+                    inspect: capInspect,
+                    'mute-guitar': capMute,
+                    'unmute-guitar': capRestore,
+                },
+                eventHandlers: {
+                    'claim:released': (detail) => clearClaimSnapshots(detail && detail.payload && detail.payload.claimId),
+                },
+            },
+        });
+        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
+    }
+
     /**
      * Public API exposed at window.stems for other plugins (e.g. stem_mixer).
      *
@@ -1438,5 +1584,6 @@
         }
     }
 
+    installCapabilityParticipant();
     installHooks();
 })();

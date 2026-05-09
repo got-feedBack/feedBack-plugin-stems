@@ -89,6 +89,14 @@ pitch to tempo as before; a one-time console warning is logged.
 
 The DSP has a headless test: `node tests/stretch-worklet.test.mjs`.
 
+## Capability Provider
+
+Stems declares and registers the `stems` capability as an owner/provider. Other plugins should request stem automation through `window.slopsmith.capabilities` instead of changing Stems internals directly. The supported commands are `mute`, `restore`, `setVolume`, `list`, and `inspect`; `mute-guitar` and `unmute-guitar` remain compatibility aliases.
+
+Automation uses session-only claim snapshots. For example, NAM claims `stems` while AMP is enabled and dispatches `stems.mute` for the guitar target; Stems stores the previous on/volume state, mutes the matching stem, and restores only that claim when NAM releases it. Capability mutes are not written to per-song localStorage.
+
+Manual user actions take precedence. When a player toggles a stem in the Stems UI, Stems records a user override with the capability registry so matching automation is reported as overridden instead of silently re-muting the user's choice.
+
 ## Requirements
 
 Requires Slopsmith with `.sloppak` format support and a `song_info` payload that includes a `stems[]` array (available on the `feature/sloppak-format` branch and its merged descendants).

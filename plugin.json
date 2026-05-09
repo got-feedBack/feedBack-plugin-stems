@@ -3,6 +3,32 @@
   "name": "Stems Toggle",
   "version": "0.6.0",
   "private": false,
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1", "profiles.v1", "settings-packs.v1"],
   "settings": { "html": "settings.html" },
-  "script": "screen.js"
+  "script": "screen.js",
+  "settings_schema": {
+    "schema_version": "1",
+    "packable_keys": ["acceptExternalMuteRequests", "manualUnmuteWins", "diagnosticsLevel"]
+  },
+  "ui": {
+    "settings": [{ "id": "stems-settings", "region": "plugin-settings", "label": "Stems Toggle" }]
+  },
+  "capabilities": {
+    "stems": {
+      "roles": ["owner", "provider"],
+      "commands": ["mute", "restore", "setVolume", "list", "inspect", "mute-guitar", "unmute-guitar"],
+      "events": ["stems.ready", "stems.mute-requested", "stems.manual-unmute", "claim:created", "claim:released"],
+      "mode": "active",
+      "compatibility": "legacy-window-shim"
+    },
+    "audio-mix": {
+      "roles": ["provider", "observer"],
+      "events": ["mix.changed"],
+      "mode": "active",
+      "compatibility": "legacy-window-shim"
+    }
+  },
+  "domains": {
+    "audio-mix": [{ "id": "stems-guitar-mute", "role": "provider" }]
+  }
 }
