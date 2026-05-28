@@ -91,7 +91,9 @@ The DSP has a headless test: `node tests/stretch-worklet.test.mjs`.
 
 ## Capability Provider
 
-Stems declares and registers the `stems` capability as an owner/provider. Other plugins should request stem automation through `window.slopsmith.capabilities` instead of changing Stems internals directly. The supported commands are `mute`, `restore`, `setVolume`, `list`, and `inspect`; `mute-guitar` and `unmute-guitar` remain compatibility aliases.
+Stems declares and registers the `stems` capability as an owner/provider. Other plugins should request stem automation through `window.slopsmith.capabilities` instead of changing Stems internals directly. The supported owner commands are `mute`, `restore`, `setVolume`, `list`, and `inspect`; `mute-guitar` and `unmute-guitar` remain compatibility aliases.
+
+The manifest uses the current capability vocabulary: Stems owns public `commands`, emits `stems.ready` and `stems.manual-unmute`, and observes `claim:released` so it can clear claim snapshots. It does not declare deferred `audio-mix` domains; stem audio remains an internal implementation detail until Slopsmith promotes an audio-mix host contract.
 
 Automation uses session-only claim snapshots. For example, NAM claims `stems` while AMP is enabled and dispatches `stems.mute` for the guitar target; Stems stores the previous on/volume state, mutes the matching stem, and restores only that claim when NAM releases it. Capability mutes are not written to per-song localStorage.
 

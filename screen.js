@@ -1494,9 +1494,15 @@
         api.registerParticipant('stems', {
             stems: {
                 roles: ['owner', 'provider'],
+                kind: 'command',
                 commands: ['mute', 'restore', 'setVolume', 'list', 'inspect', 'mute-guitar', 'unmute-guitar'],
-                events: ['stems.ready', 'stems.mute-requested', 'stems.manual-unmute', 'claim:created', 'claim:released'],
+                emits: ['stems.ready', 'stems.manual-unmute'],
+                observes: ['claim:released'],
+                description: 'Owns stem mix automation commands and exposes sloppak stem state for requester plugins.',
                 compatibility: 'legacy-window-shim',
+                ownership: 'exclusive-owner',
+                safety: 'safe',
+                version: 1,
                 runtime: true,
                 handlers: {
                     mute: capMute,
