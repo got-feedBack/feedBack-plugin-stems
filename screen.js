@@ -116,6 +116,7 @@
     let wired = false;                 // playSong hooks installed
     let container = null;              // UI container in #player-controls
     let currentFilename = null;
+    const registeredMixParticipantIds = new Set();
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player).
@@ -737,6 +738,7 @@
 
         // Stop the transport and release every buffer + node.
         stopSources();
+        unregisterStemMixParticipants();
         for (const s of stemState) {
             try { s.gain && s.gain.disconnect(); } catch (_) {}
             s.buffer = null;
@@ -790,6 +792,7 @@
 
         hideOverlay();
         pointerCleanupHandlers.clear();
+        registerStemOwnerStatus('unavailable');
         if (container) {
             container.remove();
             container = null;
@@ -948,6 +951,7 @@
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
                 saveMuted(currentFilename, stemState);
+                registerStemOwnerStatus('available');
                 recordStemUserOverride(s, 'User toggled Stems mute');
             };
             setStemVolume(s, s.vol, { persist: false });
@@ -1141,6 +1145,8 @@
             // PCM now lives in the worklet; release the main-thread AudioBuffers.
             for (const s of stemState) s.buffer = null;
         }
+        registerStemMixParticipants();
+        registerStemOwnerStatus('available');
         return true;
     }
 
@@ -1369,6 +1375,96 @@
         return window.slopsmith && window.slopsmith.capabilities;
     }
 
+    function audioSessionApi() {
+        const session = window.slopsmith && window.slopsmith.audioSession;
+        return session && session.version === 1 ? session : null;
+    }
+
+    function safeStemId(id) {
+        return String(id || 'stem').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'stem';
+    }
+
+    function stemStatesSnapshot() {
+        const snapshot = {};
+        for (const stem of stemState) {
+            snapshot[stem.id] = { id: stem.id, on: !!stem.on, muted: !stem.on, vol: stem.vol };
+        }
+        return snapshot;
+    }
+
+    function registerStemOwnerStatus(availability) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerStemOwner !== 'function') return;
+        try {
+            session.registerStemOwner({
+                ownerId: 'stems.provider',
+                participantId: 'stems.provider',
+                availability,
+                stemIds: stemState.map(stem => stem.id),
+                stemStates: stemStatesSnapshot(),
+            });
+        } catch (err) {
+            console.warn('[stems] could not register stem owner:', err);
+        }
+    }
+
+    function stemParticipantId(stem) {
+        return `stems.${safeStemId(stem && stem.id)}`;
+    }
+
+    function registerStemMixParticipant(stem) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerMixParticipant !== 'function' || !stem) return;
+        const participantId = stemParticipantId(stem);
+        try {
+            session.registerMixParticipant({
+                participantId,
+                ownerPluginId: 'stems',
+                label: `Stem: ${stem.id}`,
+                kind: 'stem',
+                sourceMode: 'native',
+                logicalFaderKey: `stems:${safeStemId(stem.id)}`,
+                fader: {
+                    id: safeStemId(stem.id),
+                    label: stem.id,
+                    min: 0,
+                    max: 1,
+                    step: 0.01,
+                    defaultValue: 1,
+                    currentValue: stem.vol,
+                },
+                operations: ['fader.get-value', 'fader.set-value'],
+                operationHandlers: {
+                    'fader.get-value': () => stem.vol,
+                    'fader.set-value': (value) => {
+                        const committed = stemsApi.setVolume(stem.id, value);
+                        return { committedValue: committed };
+                    },
+                },
+                availability: 'available',
+                version: 1,
+            });
+            registeredMixParticipantIds.add(participantId);
+        } catch (err) {
+            console.warn('[stems] could not register audio-mix fader:', err);
+        }
+    }
+
+    function registerStemMixParticipants() {
+        unregisterStemMixParticipants();
+        for (const stem of stemState) registerStemMixParticipant(stem);
+    }
+
+    function unregisterStemMixParticipants() {
+        const session = audioSessionApi();
+        if (session && typeof session.unregisterMixParticipant === 'function') {
+            for (const participantId of registeredMixParticipantIds) {
+                try { session.unregisterMixParticipant(participantId); } catch (_) {}
+            }
+        }
+        registeredMixParticipantIds.clear();
+    }
+
     function isGuitarStemId(id) {
         return /(^|[-_\s])(guitars?|rhythm|lead|dist|distortion)([-_\s]|$)/i.test(String(id || ''));
     }
@@ -1378,6 +1474,7 @@
         stem.on = !!on;
         stem.gain.gain.value = stem.on ? stem.vol : 0;
         if (stem.btn) stem.btn.className = stem.on ? ON_CLASS : OFF_CLASS;
+        registerStemOwnerStatus('available');
     }
 
     function emitStemsState(event, payload = {}) {
@@ -1394,6 +1491,11 @@
     }
 
     function recordStemUserOverride(stem, reason) {
+        const session = audioSessionApi();
+        if (session && typeof session.recordStemManualOverride === 'function') {
+            try { session.recordStemManualOverride({ requester: 'user', stemIds: [stem.id], reason }); }
+            catch (_) {}
+        }
         const api = capabilityApi();
         if (!api || typeof api.recordUserOverride !== 'function') return;
         api.recordUserOverride({
@@ -1428,9 +1530,22 @@
 
     function capMute(ctx = {}) {
         const payload = ctx.payload || {};
-        const claimId = claimIdFromContext(ctx);
+        const targets = capabilityTargets(payload);
+        let claimId = claimIdFromContext(ctx);
+        const session = audioSessionApi();
+        if (session && typeof session.muteStems === 'function') {
+            try {
+                const result = session.muteStems({
+                    claimId,
+                    requester: ctx.requester || payload.requester || 'stems.capability',
+                    stemIds: targets.map(stem => stem.id),
+                    restoreSnapshot: stemStatesSnapshot(),
+                });
+                claimId = claimId || (result && result.payload && result.payload.claimId) || null;
+            } catch (_) {}
+        }
         const mutedIds = [];
-        for (const stem of capabilityTargets(payload)) {
+        for (const stem of targets) {
             if (claimId) {
                 const key = `${claimId}:${stem.id}`;
                 if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol, filename: currentFilename });
@@ -1443,6 +1558,11 @@
 
     function capRestore(ctx = {}) {
         const claimId = claimIdFromContext(ctx);
+        const session = audioSessionApi();
+        if (session && typeof session.restoreStems === 'function' && claimId) {
+            try { session.restoreStems({ claimId, requester: ctx.requester || 'stems.capability' }); }
+            catch (_) {}
+        }
         const restoredIds = [];
         for (const [key, previous] of Array.from(claimSnapshots.entries())) {
             if (claimId && previous.claimId !== claimId) continue;
@@ -1520,7 +1640,20 @@
                 version: 1,
                 runtime: true,
             },
+            'audio-mix': {
+                roles: ['provider'],
+                operations: ['fader.get-value', 'fader.set-value'],
+                events: ['fader-value-changed', 'fader-unavailable'],
+                description: 'Registers per-stem faders with the core audio-mix coordinator while Stems owns the media graph.',
+                compatibility: 'none',
+                ownership: 'multi-provider',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
+            },
         });
+        registerStemMixParticipants();
+        registerStemOwnerStatus(stemState.length ? 'available' : 'unavailable');
         emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
     }
 
@@ -1552,23 +1685,32 @@
         })),
         setVolume(id, vol) {
             const v = Number(vol);
-            if (!Number.isFinite(v)) return;
+            if (!Number.isFinite(v)) return undefined;
             const target = String(id).toLowerCase();
+            const clamped = clampVolume(v);
+            if (clamped == null) return undefined;
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
-                setStemVolume(s, v);
+                setStemVolume(s, clamped);
+                applied = true;
             }
+            if (applied) registerStemOwnerStatus('available');
+            return applied ? clamped : undefined;
         },
         setMuted(id, muted) {
             const m = coerceBool(muted);
             const target = String(id).toLowerCase();
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 s.on = !m;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
                 saveMuted(currentFilename, stemState);
+                applied = true;
             }
+            if (applied) registerStemOwnerStatus('available');
         },
     };
     Object.defineProperty(stemsApi, 'stemState', {

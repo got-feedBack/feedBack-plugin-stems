@@ -47,8 +47,35 @@ def test_screen_no_longer_wraps_window_play_song():
     assert "basePlaySong" not in src
 
 
-def test_manifest_does_not_declare_deferred_audio_mix_domain():
+def test_manifest_declares_audio_mix_fader_provider():
     manifest = _manifest()
 
-    assert "audio-mix" not in manifest.get("capabilities", {})
+    audio_mix = manifest["capabilities"]["audio-mix"]
+    assert audio_mix["roles"] == ["provider"]
+    assert audio_mix["operations"] == ["fader.get-value", "fader.set-value"]
+    assert audio_mix["events"] == ["fader-value-changed", "fader-unavailable"]
+    assert audio_mix["compatibility"] == "none"
+    assert audio_mix["ownership"] == "multi-provider"
+    assert audio_mix["safety"] == "safe"
+    assert audio_mix["version"] == 1
     assert "domains" not in manifest
+
+
+def test_screen_uses_008_audio_session_contracts():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "registerStemOwner" in src
+    assert "recordStemManualOverride" in src
+    assert "registerMixParticipant" in src
+    assert "unregisterMixParticipant" in src
+
+
+def test_screen_uses_composable_core_audio_listeners():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "core.addEventListener(eventName, handler)" in src
+    assert "removeEventListener(eventName, handler)" in src
+    assert "core.onplay =" not in src
+    assert "core.onpause =" not in src
+    assert "core.onseeking =" not in src
+    assert "core.onratechange =" not in src

@@ -37,6 +37,17 @@
       "ownership": "observer-only",
       "safety": "safe",
       "version": 1
+    },
+    "audio-mix": {
+      "roles": ["provider"],
+      "operations": ["fader.get-value", "fader.set-value"],
+      "events": ["fader-value-changed", "fader-unavailable"],
+      "description": "Registers per-stem faders with the core audio-mix coordinator while Stems owns the media graph.",
+      "mode": "active",
+      "compatibility": "none",
+      "ownership": "multi-provider",
+      "safety": "safe",
+      "version": 1
     }
   }
 }
