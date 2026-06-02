@@ -27,6 +27,26 @@ def test_manifest_declares_stems_owner_provider_with_new_event_fields():
     assert stems["version"] == 1
 
 
+def test_manifest_declares_playback_observer_for_lifecycle_migration():
+    manifest = _manifest()
+
+    playback = manifest["capabilities"]["playback"]
+    assert playback["roles"] == ["observer"]
+    assert playback["kind"] == "lifecycle"
+    assert playback["observes"] == ["loading", "ready", "stopped", "ended"]
+    assert playback["compatibility"] == "shim-allowed"
+    assert playback["ownership"] == "observer-only"
+    assert playback["safety"] == "safe"
+    assert playback["version"] == 1
+
+
+def test_screen_no_longer_wraps_window_play_song():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "window.playSong =" not in src
+    assert "basePlaySong" not in src
+
+
 def test_manifest_does_not_declare_deferred_audio_mix_domain():
     manifest = _manifest()
 

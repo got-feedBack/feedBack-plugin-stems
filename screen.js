@@ -120,6 +120,7 @@
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player).
     let pollHandle = null;
+    let readySignature = null;
     const pointerCleanupHandlers = new Set();
     const claimSnapshots = new Map();  // claimId:stemId -> previous session-only state
 
@@ -1270,72 +1271,50 @@
         if (pendingPlay) { pendingPlay = false; transportPlay(); }
     }
 
-    // ── Hook playSong ──
+    function songInfoSignature(info) {
+        const stems = Array.isArray(info && info.stems) ? info.stems : [];
+        return JSON.stringify({
+            filename: currentFilename || (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || '',
+            stems: stems.map(s => ({ id: s.id, url: s.url, default: !!s.default })),
+        });
+    }
+
+    function tryInitForCurrentSong() {
+        const info = highway.getSongInfo && highway.getSongInfo();
+        if (!info || !Array.isArray(info.stems)) return false;
+        const signature = songInfoSignature(info);
+        if (signature === readySignature) return true;
+        readySignature = signature;
+        currentFilename = currentFilename || info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || null;
+        try { onSongReady(); } catch (e) { console.warn('[stems] init failed:', e); }
+        return true;
+    }
+
+    function startReadyPoll() {
+        if (pollHandle !== null) clearInterval(pollHandle);
+        let attempts = 0;
+        let myHandle;
+        myHandle = setInterval(() => {
+            attempts++;
+            if (tryInitForCurrentSong() || attempts >= 30) {
+                clearInterval(myHandle);
+                if (pollHandle === myHandle) pollHandle = null;
+            }
+        }, 200);
+        pollHandle = myHandle;
+    }
+
+    // ── Playback lifecycle hooks ──
     function installHooks() {
         const hookState = window.__slopsmithStemsHooks || (window.__slopsmithStemsHooks = {});
         hookState.impl = {
-            beforePlaySong(f) {
-                teardown(); // kill any prior graph before new song loads
-                currentFilename = f;
+            onPlaybackLoading(detail = {}) {
+                readySignature = null;
+                teardown();
+                currentFilename = detail.filename || (detail.target && detail.target.filename) || currentFilename || null;
             },
-            afterPlaySong(f) {
-                // Three independent paths to fire onSongReady, all protected
-                // by `handled` so we only build the graph once. Three paths
-                // because the wrapper chain can lose either the synchronous
-                // fast-path OR the _onReady hook depending on timing:
-                //
-                //   (1) _onReady hook — normal path.
-                //   (2) Synchronous fast-path — info.title AND info.stems are
-                //       already there when our wrapper resumes.
-                //   (3) Poll fallback — covers the race where 'ready' fires
-                //       AFTER inner wrappers' awaits resolved but BEFORE we
-                //       reach this post-await code.
-                const myFile = f;
-                let handled = false;
-                const fire = () => {
-                    if (handled) return;
-                    if (currentFilename !== myFile) return;
-                    handled = true;
-                    Promise.resolve()
-                        .then(() => onSongReady())
-                        .catch((e) => console.warn('[stems] init failed:', e));
-                };
-                const prev = highway._onReady;
-                const readyFn = () => {
-                    fire();
-                    if (prev) prev();
-                    if (highway._onReady === readyFn) highway._onReady = null;
-                };
-                highway._onReady = readyFn;
-
-                const infoNow = highway.getSongInfo && highway.getSongInfo();
-                if (infoNow && infoNow.title && Array.isArray(infoNow.stems)) {
-                    highway._onReady = null;
-                    fire();
-                    if (prev) prev();
-                } else {
-                    let attempts = 0;
-                    let myHandle;
-                    myHandle = setInterval(() => {
-                        attempts++;
-                        if (handled || currentFilename !== myFile || attempts >= 30) {
-                            clearInterval(myHandle);
-                            if (pollHandle === myHandle) pollHandle = null;
-                            return;
-                        }
-                        const info = highway.getSongInfo && highway.getSongInfo();
-                        if (info && info.title && Array.isArray(info.stems)) {
-                            clearInterval(myHandle);
-                            if (pollHandle === myHandle) pollHandle = null;
-                            if (!handled) {
-                                if (highway._onReady === readyFn) highway._onReady = null;
-                                fire();
-                                if (prev) prev();
-                            }
-                        }
-                    }, 200);
-                    pollHandle = myHandle;
-                }
+            onPlaybackReady() {
+                if (!tryInitForCurrentSong()) startReadyPoll();
             },
             teardown,
         };
@@ -1346,15 +1325,28 @@
         installAudioShims();
         exposeStemsGlobals();
 
-        const _play = window.playSong;
-        hookState.basePlaySong = _play;
-        window.playSong = async function (f, a) {
-            const beforeImpl = hookState.impl;
-            if (beforeImpl && typeof beforeImpl.beforePlaySong === 'function') beforeImpl.beforePlaySong(f, a);
-            await hookState.basePlaySong.call(this, f, a);
-            const afterImpl = hookState.impl;
-            if (afterImpl && typeof afterImpl.afterPlaySong === 'function') afterImpl.afterPlaySong(f, a);
+        const onLoading = (event) => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackLoading === 'function') impl.onPlaybackLoading(event && event.detail || {});
         };
+        const onReady = () => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackReady === 'function') impl.onPlaybackReady();
+        };
+        const onFinished = () => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.teardown === 'function') impl.teardown();
+        };
+        hookState.listeners = { onLoading, onReady, onFinished };
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            window.slopsmith.on('song:loading', onLoading);
+            window.slopsmith.on('playback:loading', onLoading);
+            window.slopsmith.on('playback:ready', onReady);
+            window.slopsmith.on('song:loaded', onReady);
+            window.slopsmith.on('song:ready', onReady);
+            window.slopsmith.on('playback:stopped', onFinished);
+            window.slopsmith.on('playback:ended', onFinished);
+        }
 
         // Clean up on leaving the player
         const _show = window.showScreen;
@@ -1516,6 +1508,17 @@
                 eventHandlers: {
                     'claim:released': (detail) => clearClaimSnapshots(detail && detail.payload && detail.payload.claimId),
                 },
+            },
+            playback: {
+                roles: ['observer'],
+                kind: 'lifecycle',
+                observes: ['loading', 'ready', 'stopped', 'ended'],
+                description: 'Observes playback lifecycle events to rebuild or tear down the stem graph without wrapping window.playSong.',
+                compatibility: 'shim-allowed',
+                ownership: 'observer-only',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
             },
         });
         emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });

@@ -3,7 +3,7 @@
   "name": "Stems Toggle",
   "version": "0.6.0",
   "private": false,
-  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1", "profiles.v1", "settings-packs.v1"],
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "settings": { "html": "settings.html" },
   "script": "screen.js",
   "settings_schema": {
@@ -24,6 +24,17 @@
       "mode": "active",
       "compatibility": "legacy-window-shim",
       "ownership": "exclusive-owner",
+      "safety": "safe",
+      "version": 1
+    },
+    "playback": {
+      "roles": ["observer"],
+      "kind": "lifecycle",
+      "observes": ["loading", "ready", "stopped", "ended"],
+      "description": "Observes playback lifecycle events to rebuild or tear down the stem graph without wrapping window.playSong.",
+      "mode": "active",
+      "compatibility": "shim-allowed",
+      "ownership": "observer-only",
       "safety": "safe",
       "version": 1
     }
