@@ -70,11 +70,13 @@ def test_screen_uses_008_audio_session_contracts():
     assert "unregisterMixParticipant" in src
 
 
-def test_screen_uses_composable_core_audio_listeners():
+def test_screen_uses_buffer_transport_shims_without_property_handlers():
     src = (ROOT / "screen.js").read_text(encoding="utf-8")
 
-    assert "core.addEventListener(eventName, handler)" in src
-    assert "removeEventListener(eventName, handler)" in src
+    assert "Object.defineProperty(core, 'currentTime'" in src
+    assert "core.play = function" in src
+    assert "core.pause = function" in src
+    assert "core.addEventListener('ratechange'" in src
     assert "core.onplay =" not in src
     assert "core.onpause =" not in src
     assert "core.onseeking =" not in src
@@ -104,4 +106,13 @@ def test_screen_reports_missing_set_volume_target():
 
     assert "const committed = stemsApi.setVolume" in src
     assert "if (committed === undefined)" in src
+    assert "Stem ${stem.id} is no longer available" in src
     assert "committedValue: committed" in src
+
+
+def test_screen_requires_claim_id_for_restore():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "Restore requires a claimId" in src
+    assert "if (previous.claimId !== claimId) continue" in src
+    assert "if (claimId && previous.claimId !== claimId) continue" not in src

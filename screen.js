@@ -1468,6 +1468,7 @@
                     'fader.get-value': () => stem.vol,
                     'fader.set-value': (value) => {
                         const committed = stemsApi.setVolume(stem.id, value);
+                        if (committed === undefined) return { outcome: 'no-target', reason: `Stem ${stem.id} is no longer available` };
                         return { committedValue: committed };
                     },
                 },
@@ -1594,6 +1595,9 @@
 
     function capRestore(ctx = {}) {
         const claimId = claimIdFromContext(ctx);
+        if (!claimId) {
+            return { outcome: 'no-target', reason: 'Restore requires a claimId', payload: redactedSongRef({ restoredIds: [] }) };
+        }
         const session = audioSessionApi();
         if (session && typeof session.restoreStems === 'function' && claimId) {
             try { session.restoreStems({ claimId, requester: ctx.requester || 'stems.capability' }); }
@@ -1601,7 +1605,7 @@
         }
         const restoredIds = [];
         for (const [key, previous] of Array.from(claimSnapshots.entries())) {
-            if (claimId && previous.claimId !== claimId) continue;
+            if (previous.claimId !== claimId) continue;
             const stem = stemState.find(s => s.id === previous.id);
             if (stem) {
                 applyStemState(stem, previous.prevOn, previous.prevVol);
