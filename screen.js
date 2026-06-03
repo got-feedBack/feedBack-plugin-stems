@@ -116,6 +116,7 @@
     let wired = false;                 // playSong hooks installed
     let container = null;              // UI container in #player-controls
     let currentFilename = null;
+    let currentSongKey = null;
     const registeredMixParticipantIds = new Set();
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
@@ -333,7 +334,7 @@
         stem.vol = clamped;
         if (stem.on && stem.gain) stem.gain.gain.value = clamped;
         updateStemButton(stem, options);
-        if (options.persist !== false && changed) saveVolume(currentFilename, stem.id, clamped);
+        if (options.persist !== false && changed) saveVolume(storageSongKey(), stem.id, clamped);
         return true;
     }
 
@@ -717,6 +718,25 @@
         if (overlayEl) { overlayEl.remove(); overlayEl = null; }
     }
 
+    function hashString(value) {
+        const text = String(value || '');
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(36);
+    }
+
+    function storageSongKey() {
+        return currentSongKey || currentFilename || '';
+    }
+
+    function redactedSongRef(extra = {}) {
+        const songKey = currentSongKey || (currentFilename ? `legacy-${hashString(currentFilename)}` : '');
+        return songKey ? { songKey, ...extra } : { ...extra };
+    }
+
     // ── Teardown ──
     function teardown() {
         cleanupPointerHandlers();
@@ -950,7 +970,7 @@
                 s.on = !s.on;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(currentFilename, stemState);
+                saveMuted(storageSongKey(), stemState);
                 registerStemOwnerStatus('available');
                 recordStemUserOverride(s, 'User toggled Stems mute');
             };
@@ -1030,8 +1050,13 @@
 
         const karaoke = karaokeDefault();
         const defaultMuted = loadDefaultMuted();
-        const savedMuted = loadMuted(currentFilename);
-        const savedVols = loadVolumes(currentFilename);
+        const key = storageSongKey();
+        const savedMuted = loadMuted(key) || (currentSongKey ? loadMuted(currentFilename) : null);
+        const savedVols = (() => {
+            const primary = loadVolumes(key);
+            if (Object.keys(primary).length || !currentSongKey) return primary;
+            return loadVolumes(currentFilename);
+        })();
 
         // masterGain sums every stem and is driven by the Song fader.
         masterGain = ctx.createGain();
@@ -1279,8 +1304,10 @@
 
     function songInfoSignature(info) {
         const stems = Array.isArray(info && info.stems) ? info.stems : [];
+        const filename = (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || '';
         return JSON.stringify({
-            filename: currentFilename || (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || '',
+            songKey: currentSongKey || '',
+            filename,
             stems: stems.map(s => ({ id: s.id, url: s.url, default: !!s.default })),
         });
     }
@@ -1291,7 +1318,7 @@
         const signature = songInfoSignature(info);
         if (signature === readySignature) return true;
         readySignature = signature;
-        currentFilename = currentFilename || info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || null;
+        currentFilename = info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || null;
         try { onSongReady(); } catch (e) { console.warn('[stems] init failed:', e); }
         return true;
     }
@@ -1315,9 +1342,12 @@
         const hookState = window.__slopsmithStemsHooks || (window.__slopsmithStemsHooks = {});
         hookState.impl = {
             onPlaybackLoading(detail = {}) {
+                const payload = detail.payload && typeof detail.payload === 'object' ? detail.payload : detail;
+                const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
                 readySignature = null;
                 teardown();
-                currentFilename = detail.filename || (detail.target && detail.target.filename) || currentFilename || null;
+                currentSongKey = target.settingsKey || payload.settingsKey || null;
+                currentFilename = payload.filename || target.filename || currentFilename || null;
             },
             onPlaybackReady() {
                 if (!tryInitForCurrentSong()) startReadyPoll();
@@ -1478,7 +1508,7 @@
     }
 
     function emitStemsState(event, payload = {}) {
-        const detail = { event, filename: currentFilename, ...payload };
+        const detail = { event, ...redactedSongRef(), ...payload };
         try { window.dispatchEvent(new CustomEvent('stems:state', { detail })); } catch (_) {}
         const api = capabilityApi();
         if (api && typeof api.emitEvent === 'function') {
@@ -1506,7 +1536,7 @@
             selector: stemSelector(stem),
             reason,
         });
-        if (typeof api.emitEvent === 'function') api.emitEvent('stems', 'stems.manual-unmute', { id: stem.id, on: stem.on, filename: currentFilename });
+        if (typeof api.emitEvent === 'function') api.emitEvent('stems', 'stems.manual-unmute', redactedSongRef({ id: stem.id, on: stem.on }));
     }
 
     function capabilityTargets(payload = {}) {
@@ -1532,10 +1562,10 @@
         const payload = ctx.payload || {};
         const targets = capabilityTargets(payload);
         if (!stemState.length) {
-            return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: { filename: currentFilename, mutedIds: [] } };
+            return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ mutedIds: [] }) };
         }
         if (!targets.length) {
-            return { outcome: 'no-target', reason: 'No matching stem target is available', payload: { filename: currentFilename, mutedIds: [] } };
+            return { outcome: 'no-target', reason: 'No matching stem target is available', payload: redactedSongRef({ mutedIds: [] }) };
         }
         let claimId = claimIdFromContext(ctx);
         const session = audioSessionApi();
@@ -1554,12 +1584,12 @@
         for (const stem of targets) {
             if (claimId) {
                 const key = `${claimId}:${stem.id}`;
-                if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol, filename: currentFilename });
+                if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol });
             }
             applyStemState(stem, false, stem.vol);
             mutedIds.push(stem.id);
         }
-        return { outcome: 'handled', payload: { claimId, mutedIds, filename: currentFilename } };
+        return { outcome: 'handled', payload: redactedSongRef({ claimId, mutedIds }) };
     }
 
     function capRestore(ctx = {}) {
@@ -1579,7 +1609,7 @@
             }
             claimSnapshots.delete(key);
         }
-        return { outcome: 'handled', payload: { claimId, restoredIds, filename: currentFilename } };
+        return { outcome: 'handled', payload: redactedSongRef({ claimId, restoredIds }) };
     }
 
     function clearClaimSnapshots(claimId) {
@@ -1591,16 +1621,18 @@
 
     function capSetVolume(ctx = {}) {
         const payload = ctx.payload || {};
-        stemsApi.setVolume(payload.id || payload.target?.id, payload.vol ?? payload.volume);
-        return { outcome: 'handled', payload: capList().payload };
+        if (!stemState.length) return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ stems: [] }) };
+        const committed = stemsApi.setVolume(payload.id || payload.target?.id, payload.vol ?? payload.volume);
+        if (committed === undefined) return { outcome: 'no-target', reason: 'No matching stem target is available', payload: capList().payload };
+        return { outcome: 'handled', payload: { ...capList().payload, committedValue: committed } };
     }
 
     function capList() {
-        return { outcome: 'handled', payload: { filename: currentFilename, stems: stemsApi.getState().map(s => ({ id: s.id, vol: s.vol, on: s.on })) } };
+        return { outcome: 'handled', payload: redactedSongRef({ stems: stemsApi.getState().map(s => ({ id: s.id, vol: s.vol, on: s.on })) }) };
     }
 
     function capInspect() {
-        return { outcome: 'handled', payload: { filename: currentFilename, activeClaims: Array.from(claimSnapshots.values()), stems: capList().payload.stems } };
+        return { outcome: 'handled', payload: redactedSongRef({ activeClaims: Array.from(claimSnapshots.values()), stems: capList().payload.stems }) };
     }
 
     function installCapabilityParticipant() {
@@ -1713,7 +1745,7 @@
                 s.on = !m;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(currentFilename, stemState);
+                saveMuted(storageSongKey(), stemState);
                 applied = true;
             }
             if (applied) registerStemOwnerStatus('available');
