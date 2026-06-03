@@ -1531,6 +1531,12 @@
     function capMute(ctx = {}) {
         const payload = ctx.payload || {};
         const targets = capabilityTargets(payload);
+        if (!stemState.length) {
+            return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: { filename: currentFilename, mutedIds: [] } };
+        }
+        if (!targets.length) {
+            return { outcome: 'no-target', reason: 'No matching stem target is available', payload: { filename: currentFilename, mutedIds: [] } };
+        }
         let claimId = claimIdFromContext(ctx);
         const session = audioSessionApi();
         if (session && typeof session.muteStems === 'function') {

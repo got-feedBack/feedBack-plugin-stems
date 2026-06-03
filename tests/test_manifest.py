@@ -79,3 +79,11 @@ def test_screen_uses_composable_core_audio_listeners():
     assert "core.onpause =" not in src
     assert "core.onseeking =" not in src
     assert "core.onratechange =" not in src
+
+
+def test_screen_reports_empty_mute_targets_as_unhandled():
+    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+
+    assert "outcome: 'no-owner'" in src
+    assert "outcome: 'no-target'" in src
+    assert "No matching stem target is available" in src
