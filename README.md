@@ -2,7 +2,7 @@
 
 A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that turns multi-stem `.sloppak` songs into a live mixing board. Toggle guitar, bass, drums, vocals, piano, or "other" on the fly during playback, tweak each stem's volume, and the plugin remembers your mix per song.
 
-PSARC songs are untouched — the plugin only activates when a song's `song_info` payload contains a non-empty `stems[]` array.
+archive songs are untouched — the plugin only activates when a song's `song_info` payload contains a non-empty `stems[]` array.
 
 ## Features
 
@@ -12,8 +12,8 @@ PSARC songs are untouched — the plugin only activates when a song's `song_info
 - **Mute on load** — pick which stems start silenced when a song opens (e.g. always start with vocals off)
 - **Karaoke mode** — one-click preset that always mutes vocals by default
 - **Sample-locked playback** — every stem plays from a decoded `AudioBuffer` through one shared `AudioContext`, so the stems and the note highway are sample-exact and cannot drift apart
-- **Pitch-preserving speed control** — slowing a song down (or speeding it up) changes tempo only, not pitch, just like PSARC playback
-- **Inert on PSARC** — core audio works normally when there are no stems to mix
+- **Pitch-preserving speed control** — slowing a song down (or speeding it up) changes tempo only, not pitch, just like archive playback
+- **Inert on archive** — core audio works normally when there are no stems to mix
 
 ## Installation
 
@@ -25,7 +25,7 @@ docker compose restart
 
 ## Usage
 
-1. Convert a PSARC to a `.sloppak` with the [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) plugin (which runs Demucs to split the single mixed track into per-instrument stems), or hand-craft a sloppak directory with multiple stems listed in `manifest.yaml`.
+1. Convert a archive to a `.sloppak` with the [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) plugin (which runs Demucs to split the single mixed track into per-instrument stems), or hand-craft a sloppak directory with multiple stems listed in `manifest.yaml`.
 2. Play the song. The stem mixer bar appears in `#player-controls` with one labeled button per stem.
 3. Click a stem to toggle it on/off. Drag left or right across the button to adjust its volume continuously.
 4. Your mute state and volumes are remembered the next time you open the same song.
@@ -67,7 +67,7 @@ Transport (play / pause / seek / speed) operates on all stems atomically:
 seeking stops and recreates every source node at the new offset so they
 restart locked. Toggling a stem is a pure `GainNode.gain.value` change.
 
-PSARC songs (no stems) and the JUCE desktop path are untouched — the `<audio>`
+archive songs (no stems) and the JUCE desktop path are untouched — the `<audio>`
 shims delegate straight to core whenever no sloppak is active.
 
 ### Pitch-preserving speed (worklet)
@@ -95,7 +95,7 @@ Requires Slopsmith with `.sloppak` format support and a `song_info` payload that
 
 ## Other Plugins
 
-- [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) — convert PSARCs into `.sloppak` files in-app, with optional Demucs stem splitting
+- [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) — convert archives into `.sloppak` files in-app, with optional Demucs stem splitting
 
 ## License
 

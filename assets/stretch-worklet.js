@@ -5,7 +5,7 @@
  *  acts as the source node for the stems graph. It mixes all stems (with
  *  live per-stem gains) into one signal and time-stretches that single mix
  *  with WSOLA (Waveform-Similarity Overlap-Add), so changing playback speed
- *  changes tempo WITHOUT changing pitch — matching what PSARC playback gets
+ *  changes tempo WITHOUT changing pitch — matching what archive playback gets
  *  for free from HTMLMediaElement.preservesPitch.
  *
  *  Why a worklet-as-source instead of a mid-graph effect: a mid-graph

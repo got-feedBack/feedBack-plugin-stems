@@ -13,7 +13,7 @@
      *  source. Instead its play/pause/currentTime/duration/paused members
      *  are shimmed to drive the buffer transport, and the transport
      *  dispatches the matching media events so the rest of slopsmith keeps
-     *  working unchanged. PSARC songs (no stems) and the JUCE desktop path
+     *  working unchanged. archive songs (no stems) and the JUCE desktop path
      *  are left completely untouched — the shims delegate to core when no
      *  sloppak is active.
      * ====================================================================== */
@@ -143,7 +143,7 @@
     // When available, a single AudioWorkletNode ('stem-mixer') OWNS every
     // stem's PCM and acts as the source: it mixes all stems and WSOLA-stretches
     // the single mix so the speed slider changes tempo without pitch (matching
-    // PSARC's HTMLMediaElement.preservesPitch). When unavailable, we fall back
+    // archive's HTMLMediaElement.preservesPitch). When unavailable, we fall back
     // to today's AudioBufferSourceNode-per-stem path (speed couples pitch).
     let workletNode = null;            // the 'stem-mixer' source node (worklet mode)
     let workletReady = false;          // ctx.audioWorklet.addModule() resolved
@@ -559,7 +559,7 @@
 
     // ── #audio transport shims ──
     // Installed once. Each member delegates to the captured core
-    // implementation when no sloppak is active, so PSARC songs and the JUCE
+    // implementation when no sloppak is active, so archive songs and the JUCE
     // desktop path behave exactly as before.
     let shimsInstalled = false;        // re-entry guard (prevents recapture/double-define)
     let shimsUsable = false;           // critical shims (currentTime + play + pause) all succeeded
@@ -794,7 +794,7 @@
 
         // Hand transport control back to the core <audio> element. After
         // this point the #audio shims delegate to core's native/JUCE
-        // behaviour, so PSARC and JUCE playback are untouched.
+        // behaviour, so archive and JUCE playback are untouched.
         sloppakActive = false;
         // Leave ctx alive — it is reused across songs to avoid browser
         // "too many AudioContexts" warnings.
@@ -1185,7 +1185,7 @@
         teardown();
         const info = highway.getSongInfo && highway.getSongInfo();
         const stems = (info && info.stems) || [];
-        if (stems.length === 0) return; // PSARC or stem-less sloppak — do nothing
+        if (stems.length === 0) return; // archive or stem-less sloppak — do nothing
 
         ensureCtx();
         // Decide per-song whether the pitch-preserving worklet is available.

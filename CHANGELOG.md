@@ -6,7 +6,7 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Added
 
-- **The speed slider now preserves pitch**, matching PSARC playback. Slowing a
+- **The speed slider now preserves pitch**, matching archive playback. Slowing a
   stemmed sloppak down (or speeding it up) changes tempo only — the pitch
   stays put. This closes the 0.5.0 known limitation.
 
@@ -67,7 +67,7 @@ All notable changes to the Stems Toggle plugin are documented here.
   Its `play` / `pause` / `currentTime` / `duration` / `paused` members are
   shimmed to drive the buffer transport, and the transport dispatches the
   matching media events so the rest of slopsmith is unaffected. The shims
-  delegate to core whenever no sloppak is active, so **PSARC songs and the
+  delegate to core whenever no sloppak is active, so **archive songs and the
   JUCE desktop path are completely untouched**.
 
 - The Song fader now drives a single master `GainNode` that sums every stem
