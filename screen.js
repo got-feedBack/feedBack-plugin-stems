@@ -963,7 +963,7 @@
 
         // Insert before the separator span, same pattern invert uses
         const separator = c.querySelector('span.text-gray-700');
-        if (separator) c.insertBefore(container, separator);
+        if (separator && separator.parentNode === c) c.insertBefore(container, separator);
         else c.appendChild(container);
     }
 
