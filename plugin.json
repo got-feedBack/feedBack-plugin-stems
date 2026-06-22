@@ -3,6 +3,12 @@
   "name": "Stems Toggle",
   "version": "0.6.0",
   "private": false,
-  "settings": { "html": "settings.html" },
-  "script": "screen.js"
+  "settings": {
+    "html": "settings.html",
+    "category": "audio"
+  },
+  "script": "screen.js",
+  "category": "audio",
+  "description": "Separate and control individual song stems.",
+  "icon": "assets/thumb.svg"
 }
