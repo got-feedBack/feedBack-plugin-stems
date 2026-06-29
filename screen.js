@@ -155,6 +155,39 @@
                                        // 0 = unknown → no compensation until the
                                        // worklet's 'ready' message reports it.
     let latencyOffsetSec = 0;          // that latency expressed in song time
+    // Pristine full-mix track (feedBack#580 / core #583). When a sloppak ships
+    // a pre-separation `original_audio` mixdown, we load it as one extra worklet
+    // track and play IT instead of the lossy demucs recombination whenever every
+    // stem is on at 100% ("unity"); the moment any stem is muted/attenuated we
+    // cross to the separated stems. Worklet path only; -1 = no full-mix track.
+    let fullTrackIndex = -1;
+
+    // --- computeMixGains (pure; node-testable, see tests/mix-routing.test.mjs) ---
+    // Given each stem's {on, vol} and whether a pristine full-mix track is
+    // loaded, return the worklet gains. At unity (a full mix is present AND every
+    // stem is on at ~100%) the full mix plays alone and the stems are silent;
+    // otherwise the stems mix at their own gains and the full mix is silent.
+    function computeMixGains(stems, hasFull) {
+        const unity = !!hasFull && stems.length > 0
+            && stems.every((s) => s.on && Math.abs((s.vol == null ? 1 : s.vol) - 1) < 1e-3);
+        const stemGains = stems.map((s) => (unity ? 0 : (s.on ? (s.vol == null ? 1 : s.vol) : 0)));
+        return { unity, stemGains, fullGain: hasFull ? (unity ? 1 : 0) : null };
+    }
+    // --- end computeMixGains ---
+
+    // Post the authoritative gain for every track (stems + the full mix) to the
+    // worklet, honouring the unity → full-mix routing. Called on any stem change
+    // (via the gain handle below) when a full-mix track exists.
+    function applyMixRouting() {
+        if (!(useWorklet && workletNode && workletPostReady)) return;
+        const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+        for (let i = 0; i < stemGains.length; i++) {
+            try { workletNode.port.postMessage({ type: 'gain', index: i, value: stemGains[i] }); } catch (_) {}
+        }
+        if (fullTrackIndex >= 0 && fullGain != null) {
+            try { workletNode.port.postMessage({ type: 'gain', index: fullTrackIndex, value: fullGain }); } catch (_) {}
+        }
+    }
 
     function cleanupPointerHandlers() {
         for (const cleanup of pointerCleanupHandlers) {
@@ -286,7 +319,21 @@
             set(nv) {
                 const num = Number(nv);
                 value = Number.isFinite(num) ? num : 0;
-                if (workletPostReady && workletNode) {
+                // With a pristine full-mix track loaded, every stem change must
+                // re-evaluate unity routing (which also flips the full track), so
+                // route through applyMixRouting; it posts the authoritative gain
+                // for this and every other track. Without a full mix, keep the
+                // original direct per-stem post (byte-identical behaviour).
+                if (fullTrackIndex >= 0) {
+                    // applyMixRouting recomputes every gain from stemState. The
+                    // internal toggle/volume paths set stemState first, but an
+                    // EXTERNAL direct `gain.value = v` write doesn't — so reflect
+                    // a positive write into the authoritative volume here, else
+                    // routing would ignore it. (A 0 write is left to setMuted,
+                    // which can distinguish "muted" from "0% volume".)
+                    if (value > 0 && stemState[index]) stemState[index].vol = value;
+                    applyMixRouting();
+                } else if (workletPostReady && workletNode) {
                     try { workletNode.port.postMessage({ type: 'gain', index, value }); } catch (_) {}
                 }
             },
@@ -754,6 +801,7 @@
             workletNode = null;
         }
         workletPostReady = false;
+        fullTrackIndex = -1;
         latencyOffsetSec = 0;
         // Back to "unknown" — the next song's worklet re-reports it via 'ready'.
         workletLatencyOutSamples = 0;
@@ -1010,9 +1058,28 @@
         return out;
     }
 
+    // Fetch + decode the pristine full-mix mixdown. Returns the AudioBuffer, or
+    // null if it's superseded / missing / fails to decode — in which case the
+    // caller just plays the separated stems (no full-mix optimisation).
+    async function loadFullMix(url, gen, signal) {
+        try {
+            const resp = await fetch(url, { signal });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const arrayBuf = await resp.arrayBuffer();
+            if (gen !== loadGeneration) return null;
+            const buffer = await decodeAudioData(arrayBuf);
+            return gen === loadGeneration ? buffer : null;
+        } catch (err) {
+            if (gen !== loadGeneration) return null;
+            console.warn('[stems] full-mix load failed; using separated stems only:', err);
+            return null;
+        }
+    }
+
     // Build the Web Audio graph from decoded buffers. Returns true on
-    // success, false if nothing decoded (caller should bail).
-    function buildGraphFromBuffers(results) {
+    // success, false if nothing decoded (caller should bail). `fullBuffer` is
+    // the optional pristine full-mix track (worklet path only).
+    function buildGraphFromBuffers(results, fullBuffer) {
         const ok = results.filter(r => r && r.buffer);
         if (ok.length === 0) {
             console.error('[stems] no stems decoded — reverting to core audio');
@@ -1122,7 +1189,45 @@
                 }
                 stemsMsg.push({ channels, length: buf.length });
             }
-            const gains = stemState.map(s => (s.on ? s.vol : 0));
+            // Append the pristine full mix as one extra track (index after the
+            // real stems), so unity playback uses it instead of the lossy
+            // recombination — but ONLY when its length matches the stems within
+            // tolerance. original_audio is a SEPARATE encode (codec priming can
+            // shift it slightly); the transport/highway timeline tracks the
+            // stems, and the worklet ends at its longest track, so a longer mix
+            // would play past the song end and a shorter/wrong one would drop to
+            // silence mid-song at unity. A gross mismatch means the wrong or a
+            // desynced file → ignore it and play the separated stems. We also
+            // clamp the posted length to the stems so the mix can never extend
+            // the song past where the stems (and the highway) end. The worklet
+            // mixes any channel layout (a mono track feeds both outputs), so no
+            // channel-count check is needed.
+            fullTrackIndex = -1;
+            const stemMaxLen = stemsMsg.reduce((m, s) => Math.max(m, s.length), 0);
+            if (fullBuffer) {
+                const tol = Math.max(2048, Math.round(0.05 * (ctx ? ctx.sampleRate : 48000)));
+                if (Math.abs(fullBuffer.length - stemMaxLen) > tol) {
+                    console.warn('[stems] original_audio length off by '
+                        + (fullBuffer.length - stemMaxLen) + ' samples (> ' + tol
+                        + '); ignoring it, using separated stems only.');
+                } else {
+                    const channels = [];
+                    for (let ch = 0; ch < fullBuffer.numberOfChannels; ch++) {
+                        const copy = fullBuffer.getChannelData(ch).slice();
+                        channels.push(copy);
+                        transfer.push(copy.buffer);
+                    }
+                    // Clamp to the stem length so this track can't push the
+                    // worklet's `total` past the transport/highway end.
+                    stemsMsg.push({ channels, length: Math.min(fullBuffer.length, stemMaxLen) });
+                    fullTrackIndex = stemState.length;   // tracks come after the stems
+                }
+            }
+            // Initial gains honour unity routing: at unity the full mix plays
+            // alone (stems silent); otherwise stems mix and the full track is 0.
+            const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+            const gains = stemGains.slice();
+            if (fullTrackIndex >= 0) gains.push(fullGain);
             try {
                 workletNode.port.postMessage({ type: 'load', stems: stemsMsg, gains }, transfer);
             } catch (e) {
@@ -1229,9 +1334,18 @@
         const gen = loadGeneration;
         abortController = new AbortController();
 
-        let results;
+        // Pristine full-mix mixdown, if the pack ships one (core #583 exposes
+        // it on song_info). Worklet path only — it rides the same time-stretch
+        // graph as an extra track. A failed/absent full mix degrades silently to
+        // separated-stems playback (loadFullMix returns null).
+        const fullUrl = (useWorklet && info && info.has_original_audio) ? info.original_audio_url : null;
+
+        let results, fullBuf = null;
         try {
-            results = await loadStems(stems, gen, abortController.signal);
+            [results, fullBuf] = await Promise.all([
+                loadStems(stems, gen, abortController.signal),
+                fullUrl ? loadFullMix(fullUrl, gen, abortController.signal) : Promise.resolve(null),
+            ]);
         } catch (e) {
             console.error('[stems] loadStems error:', e);
             results = null;
@@ -1244,7 +1358,7 @@
         // Capture play intent before buildGraphFromBuffers — on failure it runs
         // teardown(), which clears pendingPlay.
         const wantedPlay = pendingPlay;
-        if (!buildGraphFromBuffers(results)) {
+        if (!buildGraphFromBuffers(results, fullBuf)) {
             hideOverlay();
             // No stems decoded: teardown() inside buildGraphFromBuffers reverted
             // to core control (sloppakActive=false), so the #audio shims now

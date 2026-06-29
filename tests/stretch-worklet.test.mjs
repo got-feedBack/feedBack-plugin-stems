@@ -136,6 +136,24 @@ const sine = makeSine(FREQ, 4.0);
     check('gain 0 mutes a stem', maxErr < 1e-6, `maxErr=${maxErr.toExponential(2)}`);
 }
 
+// === Test 5b: a gain change DURING playback ramps (no click / hard switch) ===
+// (this is the unity<->stems crossover smoothing — feedBack-plugin-stems#15).
+{
+    const p = new REGISTERED();
+    const dc = new Float32Array(SR).fill(0.5); // constant 0.5 → output == 0.5 * gain
+    send(p, { type: 'load', stems: [{ channels: [dc.slice()], length: dc.length }], gains: [1] });
+    send(p, { type: 'start', offset: 0, rate: 1.0 });
+    pull(p, 4);                                  // full gain (output ~0.5)
+    send(p, { type: 'gain', index: 0, value: 0 }); // mute mid-playback
+    const out = pull(p, 16);                      // 2048 samples spanning the ramp
+    const early = Math.abs(out[64]);              // still partly audible (ramping)
+    const late = Math.abs(out[out.length - 1]);   // fully muted by the end
+    const gradual = [...out].some(v => Math.abs(v) > 0.05 && Math.abs(v) < 0.45);
+    check('in-playback gain change ramps (no hard switch)',
+        early > 0.1 && gradual && late < 1e-6,
+        `early=${early.toFixed(3)} gradual=${gradual} late=${late.toExponential(1)}`);
+}
+
 // === Test 6: 'ended' fires once past the end ===
 {
     const short = makeSine(FREQ, 0.05); // 2400 samples
