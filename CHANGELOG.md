@@ -2,6 +2,26 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [0.7.0] — Pristine full mix at unity
+
+### Added
+
+- **Plays the pristine full mix when nothing is isolated.** When a sloppak ships
+  a pre-separation `original_audio` mixdown (exposed on `song_info` by core
+  #583 / feedBack#580), the plugin now loads it as one extra time-stretch track
+  and plays **it** — not the lossy demucs recombination — whenever every stem is
+  on at 100% ("unity"). The moment any stem is muted or attenuated, it crosses
+  to the separated stems; back to unity, back to the pristine mix. This wires up
+  the consumer half of #583 (previously the field was published but unused, so
+  at-unity playback always used the recombined stems) and is the audible win
+  behind the "converted stems sound tinny at rest" reports.
+
+  Worklet path only and fully opt-in: a pack without `original_audio`, or the
+  legacy (non-worklet) fallback, behaves exactly as before. Routing is a single
+  pure `computeMixGains(stems, hasFull)` (unit-tested in
+  `tests/mix-routing.test.mjs`); the full mix rides the same WSOLA graph as the
+  stems, so speed/seek/sync are unchanged.
+
 ## [0.6.0] — Pitch-preserving speed control
 
 ### Added
