@@ -22,6 +22,16 @@ All notable changes to the Stems Toggle plugin are documented here.
   `tests/mix-routing.test.mjs`); the full mix rides the same WSOLA graph as the
   stems, so speed/seek/sync are unchanged.
 
+  Robustness: the full mix is only used when its length matches the stems within
+  tolerance (and its posted length is clamped to the stems), so a mismatched /
+  mis-encoded `original_audio` can't play past the song end or drop to silence
+  mid-song — it's ignored and the separated stems play. The unity↔stems
+  crossover (and any mid-playback mute/unmute) now **ramps gains over ~12 ms in
+  the worklet** instead of hard-switching, so swapping the entire mix at the
+  unity boundary doesn't click or jump in level (`tests/stretch-worklet.test.mjs`
+  gains a ramp test; the exact pass-through and instant pre-start gains are
+  unchanged).
+
 ## [0.6.0] — Pitch-preserving speed control
 
 ### Added

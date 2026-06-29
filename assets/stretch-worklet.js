@@ -64,7 +64,10 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         this.endedPosted = false;
 
         this.stems = [];        // [{ channels: [Float32Array(,Float32Array)], length, nch }]
-        this.gains = null;      // Float32Array, one per stem (0 == muted)
+        this.gains = null;      // Float32Array, TARGET gain per track (0 == muted)
+        this.curGains = null;   // currently-applied gain, ramped toward `gains`
+                                // over ~12 ms so a unity<->stems crossover (or any
+                                // mute/unmute mid-playback) doesn't click or jump.
         this.total = 0;         // longest stem length, in source samples
         this.rate = 1;          // tempo factor; pos advances `rate` input samples / output sample
         this.pos = 0;           // analysis read frontier, in fractional source samples
@@ -125,6 +128,9 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                         const g = Number(provided[i]);
                         this.gains[i] = Number.isFinite(g) ? g : 1;
                     }
+                    // Apply the load gains instantly (no ramp from silence on
+                    // the first sound); in-playback changes ramp from here.
+                    this.curGains = Float32Array.from(this.gains);
                 }
                 this.total = this.stems.reduce((m, s) => Math.max(m, s.length), 0);
                 this.loaded = true;
@@ -138,6 +144,10 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                 this.pos = Math.max(0, Math.round((msg.offset || 0) * sampleRate));
                 this.rate = this._coerceRate(msg.rate);
                 this._flush();
+                // Snap to the target so gains set before playback (e.g. a
+                // default-muted stem, or the initial unity routing) are exact
+                // from the first sample — only mid-playback changes ramp.
+                if (this.curGains && this.gains) this.curGains.set(this.gains);
                 this.endedPosted = false;
                 this.playing = true;
                 break;
@@ -177,6 +187,7 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                 this.disposed = true;
                 this.stems = [];
                 this.gains = null;
+                this.curGains = null;
                 break;
             default:
                 break;
@@ -199,10 +210,26 @@ class StemMixerProcessor extends AudioWorkletProcessor {
     // Mixed sample at integer source index `idx` for channel `ch` (0=L,1=R),
     // applying current per-stem gains. Out-of-range reads contribute 0. Mono
     // stems feed both output channels.
+    // Step the applied gains toward their targets, ~12 ms to traverse the full
+    // 0..1 range, called once per render quantum (output-time). A no-op when
+    // every track is already at its target (so steady playback is untouched and
+    // the pass-through path stays sample-exact).
+    _rampGains(n) {
+        const cur = this.curGains, tgt = this.gains;
+        if (!cur || !tgt) return;
+        const step = n / Math.max(1, 0.012 * sampleRate);
+        for (let i = 0; i < cur.length; i++) {
+            const d = tgt[i] - cur[i];
+            if (d > step) cur[i] += step;
+            else if (d < -step) cur[i] -= step;
+            else cur[i] = tgt[i];
+        }
+    }
+
     _mix(idx, ch) {
         let sum = 0;
         const stems = this.stems;
-        const gains = this.gains;
+        const gains = this.curGains || this.gains;
         for (let i = 0; i < stems.length; i++) {
             const g = gains[i];
             if (g === 0) continue;
@@ -321,6 +348,9 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         if (!this.loaded || !this.playing) {
             return true; // silent (outputs are zero-filled by the host)
         }
+        // Advance any in-flight gain crossfade once per quantum (output-time),
+        // before either DSP path reads gains via _mix().
+        this._rampGains(n);
 
         if (Math.abs(this.rate - 1) <= 1e-6) {
             // Pass-through mixer: exact, zero added latency.

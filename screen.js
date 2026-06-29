@@ -325,6 +325,13 @@
                 // for this and every other track. Without a full mix, keep the
                 // original direct per-stem post (byte-identical behaviour).
                 if (fullTrackIndex >= 0) {
+                    // applyMixRouting recomputes every gain from stemState. The
+                    // internal toggle/volume paths set stemState first, but an
+                    // EXTERNAL direct `gain.value = v` write doesn't — so reflect
+                    // a positive write into the authoritative volume here, else
+                    // routing would ignore it. (A 0 write is left to setMuted,
+                    // which can distinguish "muted" from "0% volume".)
+                    if (value > 0 && stemState[index]) stemState[index].vol = value;
                     applyMixRouting();
                 } else if (workletPostReady && workletNode) {
                     try { workletNode.port.postMessage({ type: 'gain', index, value }); } catch (_) {}
@@ -1184,17 +1191,37 @@
             }
             // Append the pristine full mix as one extra track (index after the
             // real stems), so unity playback uses it instead of the lossy
-            // recombination. Only when it decoded AND matches the channel layout.
+            // recombination — but ONLY when its length matches the stems within
+            // tolerance. original_audio is a SEPARATE encode (codec priming can
+            // shift it slightly); the transport/highway timeline tracks the
+            // stems, and the worklet ends at its longest track, so a longer mix
+            // would play past the song end and a shorter/wrong one would drop to
+            // silence mid-song at unity. A gross mismatch means the wrong or a
+            // desynced file → ignore it and play the separated stems. We also
+            // clamp the posted length to the stems so the mix can never extend
+            // the song past where the stems (and the highway) end. The worklet
+            // mixes any channel layout (a mono track feeds both outputs), so no
+            // channel-count check is needed.
             fullTrackIndex = -1;
+            const stemMaxLen = stemsMsg.reduce((m, s) => Math.max(m, s.length), 0);
             if (fullBuffer) {
-                const channels = [];
-                for (let ch = 0; ch < fullBuffer.numberOfChannels; ch++) {
-                    const copy = fullBuffer.getChannelData(ch).slice();
-                    channels.push(copy);
-                    transfer.push(copy.buffer);
+                const tol = Math.max(2048, Math.round(0.05 * (ctx ? ctx.sampleRate : 48000)));
+                if (Math.abs(fullBuffer.length - stemMaxLen) > tol) {
+                    console.warn('[stems] original_audio length off by '
+                        + (fullBuffer.length - stemMaxLen) + ' samples (> ' + tol
+                        + '); ignoring it, using separated stems only.');
+                } else {
+                    const channels = [];
+                    for (let ch = 0; ch < fullBuffer.numberOfChannels; ch++) {
+                        const copy = fullBuffer.getChannelData(ch).slice();
+                        channels.push(copy);
+                        transfer.push(copy.buffer);
+                    }
+                    // Clamp to the stem length so this track can't push the
+                    // worklet's `total` past the transport/highway end.
+                    stemsMsg.push({ channels, length: Math.min(fullBuffer.length, stemMaxLen) });
+                    fullTrackIndex = stemState.length;   // tracks come after the stems
                 }
-                stemsMsg.push({ channels, length: fullBuffer.length });
-                fullTrackIndex = stemState.length;   // tracks come after the stems
             }
             // Initial gains honour unity routing: at unity the full mix plays
             // alone (stems silent); otherwise stems mix and the full track is 0.

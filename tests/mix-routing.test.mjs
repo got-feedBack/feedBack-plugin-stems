@@ -14,9 +14,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
 
 // Pull the pure function out of the IIFE (it touches no DOM/closure state).
-const m = src.match(/function computeMixGains\s*\([\s\S]*?\n    \}/);
-assert.ok(m, 'computeMixGains source block not found in screen.js');
-const computeMixGains = eval('(' + m[0] + ')');
+// Capture from `function computeMixGains` up to the `// --- end computeMixGains`
+// marker that immediately follows its closing brace — no indentation assumption,
+// so it survives reformatting of the body.
+const m = src.match(/(function computeMixGains[\s\S]*?)\n\s*\/\/ --- end computeMixGains ---/);
+assert.ok(m, 'computeMixGains block (between markers) not found in screen.js');
+const computeMixGains = eval('(' + m[1] + ')');
 
 const S = (on, vol) => ({ on, vol });
 
