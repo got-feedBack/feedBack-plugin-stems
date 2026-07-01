@@ -1350,7 +1350,7 @@
         } catch (_) { return false; }
     }
 
-    // --- parseWavHeader (pure; node-testable, see tests/wav-parse.test.mjs) ---
+    // --- parseWavHeader (pure; node-testable, see tests/wav-pcm.test.mjs) ---
     // Parse a RIFF/WAV header from the leading bytes; returns
     // { nch, sampleRate, bitsPerSample, dataOffset, dataSize } or null. Only
     // 16-bit PCM is accepted (what the proxy emits). Chunk-walks fmt/data so a
@@ -1380,12 +1380,15 @@
             off = body + size + (size & 1); // chunks are word-aligned
         }
         if (!fmt || dataOffset < 0) return null;
+        // Only linear 16-bit PCM (audioFormat 1) — the rest of the streaming path
+        // reads raw Int16. Reject compressed/float WAV variants (e.g. ADPCM).
+        if (fmt.audioFormat !== 1) return null;
         if (fmt.bitsPerSample !== 16 || fmt.nch < 1 || fmt.sampleRate <= 0) return null;
         return { nch: fmt.nch, sampleRate: fmt.sampleRate, bitsPerSample: 16, dataOffset, dataSize };
     }
     // --- end parseWavHeader ---
 
-    // --- pcm16ToFloat32 (pure; node-testable, see tests/pcm-convert.test.mjs) ---
+    // --- pcm16ToFloat32 (pure; node-testable, see tests/wav-pcm.test.mjs) ---
     // De-interleave `frames` of 16-bit little-endian PCM starting at byte
     // `byteOffset` in `u8` into one Float32Array(frames) per channel, [-1, 1).
     // Reads that run past the buffer are treated as 0 (silence pad).

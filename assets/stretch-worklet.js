@@ -339,7 +339,10 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         if (urgent || this._posAccum >= this._posInterval) {
             this._posAccum = 0;
             try {
-                this.port.postMessage({ type: 'pos', pos: this.pos, writeFrontier: this.writeFrontier });
+                // Floor the read frontier: under WSOLA `pos` is fractional, and the
+                // main-thread pump does integer sample math off it (a fractional
+                // value would desync jsWriteFrontier and get appends rejected).
+                this.port.postMessage({ type: 'pos', pos: Math.floor(this.pos), writeFrontier: this.writeFrontier });
             } catch (_) { /* port closed */ }
         }
     }

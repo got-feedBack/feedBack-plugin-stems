@@ -66,6 +66,12 @@ test('parseWavHeader rejects non-16-bit PCM', () => {
     assert.equal(parseWavHeader(h), null);
 });
 
+test('parseWavHeader rejects non-PCM audio formats', () => {
+    const h = wavHeader(2, 44100, 1000);
+    new DataView(h.buffer).setUint16(20, 2, true);       // audioFormat 2 (ADPCM), still 16-bit
+    assert.equal(parseWavHeader(h), null);
+});
+
 test('parseWavHeader walks past an extra chunk before data', () => {
     // Insert a 4-byte "LIST" chunk between fmt and data.
     const nch = 2, sr = 44100, dataSize = 800, listBody = 4;

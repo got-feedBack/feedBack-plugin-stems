@@ -174,6 +174,32 @@ test("'ended' fires once the fully-fed source is played out", () => {
     assert.equal(pump.ended, 1, 'ended fired exactly once at end of song');
 });
 
+test('streaming at rate 0.5 keeps feeding (integer backpressure pos)', () => {
+    // Under WSOLA the worklet's read frontier is fractional; it must report a
+    // FLOORED integer 'pos' so the pump's sample math stays integer — otherwise
+    // jsWriteFrontier drifts fractional and appends get rejected as stale, stalling.
+    const N = 60000;
+    const sineArr = makeSine(220, N);
+    const p = new REGISTERED();
+    const pump = makePump(p, [{ channels: [sineArr] }], { chunk: 2048 });
+    const AHEAD = 8192, CAP = 20000;
+    send(p, { type: 'open', tracks: [{ nch: 1, length: N }], gains: [1], cap: CAP, startSample: 0 });
+    pump.fillTo(AHEAD);
+    send(p, { type: 'start', offset: 0, rate: 0.5 });
+
+    let audible = 0;
+    for (let q = 0; q < 400; q++) {
+        const qd = quantum(p);
+        for (let k = 0; k < qd.length; k++) if (qd[k] !== 0) { audible++; break; }
+        assert.ok(Number.isInteger(pump.lastPos), `backpressure pos is an integer (got ${pump.lastPos})`);
+        pump.fillTo(pump.lastPos + AHEAD);
+    }
+    // At 0.5x, 400 output quanta consume ~200 quanta of source; the pump must have
+    // kept feeding well past the initial prefill (appends were not all rejected).
+    assert.ok(pump.wf > AHEAD * 2, `pump advanced past prefill: wf=${pump.wf}`);
+    assert.ok(audible > 350, `output stayed audible across the run: ${audible}/400 quanta`);
+});
+
 test('under-run never fires a spurious end while data is still incoming', () => {
     const N = 40000;
     const sineArr = makeSine(220, N);
