@@ -1,20 +1,31 @@
 /* ======================================================================
  *  Stems Toggle — pitch-preserving time-stretch worklet
  *
- *  A single AudioWorkletProcessor that OWNS every stem's decoded PCM and
- *  acts as the source node for the stems graph. It mixes all stems (with
- *  live per-stem gains) into one signal and time-stretches that single mix
- *  with WSOLA (Waveform-Similarity Overlap-Add), so changing playback speed
- *  changes tempo WITHOUT changing pitch — matching what archive playback gets
- *  for free from HTMLMediaElement.preservesPitch.
+ *  A single AudioWorkletProcessor that acts as the source node for the
+ *  stems graph. It mixes all tracks (with live per-track gains) into one
+ *  signal and time-stretches that single mix with WSOLA (Waveform-Similarity
+ *  Overlap-Add), so changing playback speed changes tempo WITHOUT changing
+ *  pitch — matching what archive playback gets for free from
+ *  HTMLMediaElement.preservesPitch.
+ *
+ *  Two ways to feed it PCM:
+ *   - 'load' (desktop / full-decode): every track's PCM is handed over once,
+ *     up front, and RETAINED for the whole song (instant seek, no refill).
+ *   - 'open' + 'append' (streaming / iOS): the processor holds only a bounded
+ *     sliding window per track. The main thread pumps aligned PCM blocks as
+ *     playback consumes them, and the processor DROPS samples behind the read
+ *     frontier, so peak memory is a small window regardless of song length or
+ *     track count. Seeks flush the window; the main thread refetches from the
+ *     target and re-appends. Under-run (window not filled ahead of the read
+ *     frontier yet) STALLS to silence rather than reading unwritten samples.
  *
  *  Why a worklet-as-source instead of a mid-graph effect: a mid-graph
  *  AudioWorklet receives a fixed 128 input samples per render quantum and
  *  must emit 128, so it cannot change tempo (tempo != 1 needs input:output
- *  != 1) without starving or growing an unbounded buffer. Owning the PCM
- *  lets the processor pull input at its own rate.
+ *  != 1) without starving or growing an unbounded buffer. Owning the read
+ *  frontier lets the processor pull input at its own rate.
  *
- *  Why mix-then-stretch ONCE (not per stem): all stems share one uniform
+ *  Why mix-then-stretch ONCE (not per track): all tracks share one uniform
  *  rate, and stretching a single mixed signal is inherently sample-locked —
  *  there is no per-stream WSOLA divergence to desync the note highway.
  *
@@ -63,12 +74,28 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         this.playing = false;
         this.endedPosted = false;
 
-        this.stems = [];        // [{ channels: [Float32Array(,Float32Array)], length, nch }]
+        // ── Track storage ──
+        // Each track is { channels: [Float32Array], nch, length } where
+        // channels[ch][idx - base] holds the sample at ABSOLUTE source index
+        // `idx`, valid for base <= idx < writeFrontier. In 'load' (retain-all)
+        // mode base stays 0, writeFrontier == total and the channel arrays span
+        // the whole song. In streaming mode the arrays are fixed capacity `cap`
+        // and slide: base advances (old samples dropped) as playback consumes.
+        this.stems = [];
+        this.base = 0;             // absolute source index of channels[..][0]
+        this.writeFrontier = 0;    // absolute index one past the newest sample
+        this.cap = 0;              // per-channel capacity (streaming)
+        this.streaming = false;    // true when fed via open/append
+        // Retain a little behind the read frontier so WSOLA's backward search
+        // (grainNominal - SEARCH) and the pass-through never fall off the start
+        // of the window after a drop.
+        this.BEHIND = this.SEARCH + this.FRAME;
+
         this.gains = null;      // Float32Array, TARGET gain per track (0 == muted)
         this.curGains = null;   // currently-applied gain, ramped toward `gains`
                                 // over ~12 ms so a unity<->stems crossover (or any
                                 // mute/unmute mid-playback) doesn't click or jump.
-        this.total = 0;         // longest stem length, in source samples
+        this.total = 0;         // longest track length, in source samples
         this.rate = 1;          // tempo factor; pos advances `rate` input samples / output sample
         this.pos = 0;           // analysis read frontier, in fractional source samples
         this.inPrev = null;     // input start of the previously emitted grain (WSOLA)
@@ -98,6 +125,12 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         // centroid (FRAME/2) plus the average FIFO backlog (~SYN_HOP/2).
         this.latencyOutSamples = (this.FRAME / 2) + (this.SYN_HOP / 2);
 
+        // Backpressure: while streaming, report the read frontier to the main
+        // thread ~every 20 ms (or immediately on under-run) so it can top the
+        // window up ahead of `pos`.
+        this._posInterval = Math.max(1, Math.round(0.02 * sampleRate));
+        this._posAccum = 0;
+
         this.port.onmessage = (e) => this._onMessage(e.data);
     }
 
@@ -105,7 +138,10 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         if (!msg) return;
         switch (msg.type) {
             case 'load': {
-                // Channel arrays arrive as transferables (ownership moved here).
+                // Full-decode path (desktop). Channel arrays arrive as
+                // transferables (ownership moved here) and are RETAINED for the
+                // whole song: base=0, writeFrontier=total, no dropping.
+                this.streaming = false;
                 this.stems = (msg.stems || []).map((s) => {
                     // Guard against a malformed stem with no channels.
                     const channels = (s && Array.isArray(s.channels)) ? s.channels : [];
@@ -118,23 +154,84 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                         length: Math.min((s && s.length) | 0, chLen),
                     };
                 });
-                // Always one finite gain per stem: a short or non-finite
-                // gains array would otherwise leave _mix() reading `undefined`
-                // (=> NaN output). Missing entries default to 1 (audible).
-                {
-                    const provided = Array.isArray(msg.gains) ? msg.gains : [];
-                    this.gains = new Float32Array(this.stems.length);
-                    for (let i = 0; i < this.stems.length; i++) {
-                        const g = Number(provided[i]);
-                        this.gains[i] = Number.isFinite(g) ? g : 1;
-                    }
-                    // Apply the load gains instantly (no ramp from silence on
-                    // the first sound); in-playback changes ramp from here.
-                    this.curGains = Float32Array.from(this.gains);
-                }
+                this._initGains(msg.gains);
                 this.total = this.stems.reduce((m, s) => Math.max(m, s.length), 0);
+                this.base = 0;
+                this.writeFrontier = this.total;
                 this.loaded = true;
                 this.port.postMessage({ type: 'ready', latencyOutSamples: this.latencyOutSamples });
+                break;
+            }
+            case 'open': {
+                // Streaming path (iOS). Allocate empty bounded windows; the main
+                // thread pumps PCM via 'append'. `cap` bounds per-channel memory;
+                // `startSample` is the absolute source sample the first append
+                // will begin at (0, or a seek/resume target).
+                this.streaming = true;
+                const tracks = (msg.tracks || []);
+                // Default cap ~3 s if the main thread doesn't specify one; must
+                // comfortably exceed the behind margin + one pump chunk + the
+                // ahead target the main thread keeps buffered.
+                const defCap = Math.max(this.FRAME * 8, Math.ceil(3 * sampleRate));
+                this.cap = Math.max(this.FRAME * 4, (msg.cap | 0) || defCap);
+                this.stems = tracks.map((t) => {
+                    const nch = Math.max(1, (t && t.nch) | 0);
+                    const channels = [];
+                    for (let ch = 0; ch < nch; ch++) channels.push(new Float32Array(this.cap));
+                    return { channels, nch, length: (t && t.length) | 0 };
+                });
+                this._initGains(msg.gains);
+                this.total = this.stems.reduce((m, s) => Math.max(m, s.length), 0);
+                const start = Math.max(0, Math.round(msg.startSample || 0));
+                this.base = start;
+                this.writeFrontier = start;
+                this.pos = start;
+                this._flush();
+                this.endedPosted = false;
+                this.loaded = true;
+                this.port.postMessage({ type: 'ready', latencyOutSamples: this.latencyOutSamples });
+                break;
+            }
+            case 'append': {
+                // Aligned PCM for EVERY track at absolute sample `base` (which
+                // must equal the current writeFrontier — a stale block from
+                // before a seek is dropped). Shorter tracks are zero-padded by
+                // the sender so all tracks advance the frontier together.
+                if (!this.streaming || this.disposed || !this.loaded) break;
+                const frames = msg.frames | 0;
+                if (frames <= 0) break;
+                const startAbs = (msg.base == null) ? this.writeFrontier : (msg.base | 0);
+                if (startAbs !== this.writeFrontier) break; // stale (post-seek) — ignore
+                this._compact();
+                let local = this.writeFrontier - this.base;
+                if (local + frames > this.cap) {
+                    // Window would overflow. Backpressure should prevent this;
+                    // as a last resort drop the oldest unread samples so we never
+                    // write out of bounds.
+                    const needBase = this.writeFrontier + frames - this.cap;
+                    this._dropTo(needBase);
+                    local = this.writeFrontier - this.base;
+                    if (local + frames > this.cap) break; // still no room — skip
+                }
+                const blocks = msg.tracks || [];
+                for (let i = 0; i < this.stems.length; i++) {
+                    const t = this.stems[i];
+                    const blk = blocks[i];
+                    const srcChannels = (blk && Array.isArray(blk.channels)) ? blk.channels : null;
+                    for (let ch = 0; ch < t.nch; ch++) {
+                        const dst = t.channels[ch];
+                        const src = srcChannels && srcChannels[ch];
+                        if (src && src.length >= frames) {
+                            dst.set(src.length === frames ? src : src.subarray(0, frames), local);
+                        } else if (src && src.length > 0) {
+                            dst.set(src, local);
+                            dst.fill(0, local + src.length, local + frames);
+                        } else {
+                            dst.fill(0, local, local + frames);
+                        }
+                    }
+                }
+                this.writeFrontier += frames;
                 break;
             }
             case 'start':
@@ -160,6 +257,11 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                 this.pos = Math.max(0, Math.round((msg.offset || 0) * sampleRate));
                 this._flush();
                 this.endedPosted = false;
+                if (this.streaming) {
+                    // Discard the window; the main thread refills from the target.
+                    this.base = this.pos;
+                    this.writeFrontier = this.pos;
+                }
                 break;
             case 'rate': {
                 const r = this._coerceRate(msg.rate);
@@ -194,6 +296,54 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         }
     }
 
+    // Build gains/curGains from a provided array (missing entries default to 1,
+    // audible). Applied instantly (no ramp from silence on the first sound);
+    // in-playback changes ramp from here.
+    _initGains(provided) {
+        const arr = Array.isArray(provided) ? provided : [];
+        this.gains = new Float32Array(this.stems.length);
+        for (let i = 0; i < this.stems.length; i++) {
+            const g = Number(arr[i]);
+            this.gains[i] = Number.isFinite(g) ? g : 1;
+        }
+        this.curGains = Float32Array.from(this.gains);
+    }
+
+    // Drop every sample below absolute index `newBase`, sliding the retained
+    // tail down to channels[..][0]. Streaming only. Clamps to [base, writeFrontier].
+    _dropTo(newBase) {
+        if (newBase <= this.base) return;
+        if (newBase > this.writeFrontier) newBase = this.writeFrontier;
+        const shift = newBase - this.base;
+        if (shift <= 0) return;
+        const count = this.writeFrontier - this.base;
+        for (let i = 0; i < this.stems.length; i++) {
+            const t = this.stems[i];
+            for (let ch = 0; ch < t.nch; ch++) {
+                t.channels[ch].copyWithin(0, shift, count);
+            }
+        }
+        this.base = newBase;
+    }
+
+    // Drop samples the read frontier has passed (keeping BEHIND for WSOLA's
+    // backward reach), bounding the window. Streaming only.
+    _compact() {
+        if (!this.streaming) return;
+        const dropTo = Math.floor(this.pos) - this.BEHIND;
+        if (dropTo > this.base) this._dropTo(dropTo);
+    }
+
+    _maybePostPos(n, urgent) {
+        this._posAccum += n;
+        if (urgent || this._posAccum >= this._posInterval) {
+            this._posAccum = 0;
+            try {
+                this.port.postMessage({ type: 'pos', pos: this.pos, writeFrontier: this.writeFrontier });
+            } catch (_) { /* port closed */ }
+        }
+    }
+
     _coerceRate(r) {
         const v = Number(r);
         return (Number.isFinite(v) && v > 0) ? v : 1;
@@ -208,8 +358,26 @@ class StemMixerProcessor extends AudioWorkletProcessor {
     }
 
     // Mixed sample at integer source index `idx` for channel `ch` (0=L,1=R),
-    // applying current per-stem gains. Out-of-range reads contribute 0. Mono
-    // stems feed both output channels.
+    // applying current per-track gains. Reads outside the resident window
+    // [base, writeFrontier) contribute 0 (so under-run / past-end reads are
+    // silence). Mono tracks feed both output channels.
+    _mix(idx, ch) {
+        if (idx < this.base || idx >= this.writeFrontier) return 0;
+        const local = idx - this.base;
+        let sum = 0;
+        const stems = this.stems;
+        const gains = this.curGains || this.gains;
+        for (let i = 0; i < stems.length; i++) {
+            const g = gains[i];
+            if (g === 0) continue;
+            const s = stems[i];
+            if (idx >= s.length) continue;
+            const c = s.channels[ch < s.nch ? ch : 0];
+            sum += c[local] * g;
+        }
+        return sum;
+    }
+
     // Step the applied gains toward their targets, ~12 ms to traverse the full
     // 0..1 range, called once per render quantum (output-time). A no-op when
     // every track is already at its target (so steady playback is untouched and
@@ -224,21 +392,6 @@ class StemMixerProcessor extends AudioWorkletProcessor {
             else if (d < -step) cur[i] -= step;
             else cur[i] = tgt[i];
         }
-    }
-
-    _mix(idx, ch) {
-        let sum = 0;
-        const stems = this.stems;
-        const gains = this.curGains || this.gains;
-        for (let i = 0; i < stems.length; i++) {
-            const g = gains[i];
-            if (g === 0) continue;
-            const s = stems[i];
-            if (idx < 0 || idx >= s.length) continue;
-            const c = s.channels[ch < s.nch ? ch : 0];
-            sum += c[idx] * g;
-        }
-        return sum;
     }
 
     // Fill scratch buffers with the mixed signal over the window the next hop
@@ -337,6 +490,20 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         this.pos += H * this.rate;
     }
 
+    // True if the sliding window is filled far enough ahead of the read frontier
+    // to cover this quantum's DSP reads. In 'load' mode everything is resident,
+    // so this is always satisfied. Under-run only happens while streaming and
+    // more data is still coming (writeFrontier < total).
+    _bufferedEnough(n) {
+        if (!this.streaming) return true;
+        if (this.writeFrontier >= this.total) return true; // all data in — read to end
+        const r = this.rate;
+        const horizon = (Math.abs(r - 1) <= 1e-6)
+            ? n
+            : (Math.ceil(n * r) + this.FRAME + 2 * this.SEARCH + this.SYN_HOP);
+        return this.pos + horizon <= this.writeFrontier;
+    }
+
     process(inputs, outputs) {
         const out = outputs[0];
         const outL = out[0];
@@ -348,6 +515,16 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         if (!this.loaded || !this.playing) {
             return true; // silent (outputs are zero-filled by the host)
         }
+
+        // Under-run: the window isn't filled ahead of the read frontier yet.
+        // Stall to silence and hold `pos` (never read unwritten samples, never
+        // signal 'ended'); nudge the main thread to refill.
+        if (!this._bufferedEnough(n)) {
+            this._maybePostPos(n, true);
+            return true;
+        }
+        if (this.streaming) this._maybePostPos(n, false);
+
         // Advance any in-flight gain crossfade once per quantum (output-time),
         // before either DSP path reads gains via _mix().
         this._rampGains(n);
@@ -361,6 +538,8 @@ class StemMixerProcessor extends AudioWorkletProcessor {
                 if (stereo) outR[k] = this._mix(i0 + k, 1);
             }
             this.pos += n; // rate == 1
+            // (Window compaction happens at 'append' time, not per-quantum, to
+            // keep the audio thread free of per-quantum memmoves.)
             return true;
         }
 
@@ -368,8 +547,12 @@ class StemMixerProcessor extends AudioWorkletProcessor {
         // hop PAST the end so the final FRAME-SYN_HOP samples sitting in the
         // overlap accumulators get flushed (grains past `total` read silence,
         // fading the tail) — otherwise the last half-window is truncated and
-        // 'ended' fires ~SYN_HOP samples early.
-        while (this.fill < n && this.pos < this.total + this.SYN_HOP) this._synthHop();
+        // 'ended' fires ~SYN_HOP samples early. While streaming, also stop
+        // synthesising once the read frontier reaches the buffered edge, so we
+        // never overlap-add unwritten samples during an under-run.
+        while (this.fill < n && this.pos < this.total + this.SYN_HOP && this._bufferedEnough(n)) {
+            this._synthHop();
+        }
         if (this.fill <= 0) {
             if (this.pos >= this.total) this._endOnce();
             return true;
