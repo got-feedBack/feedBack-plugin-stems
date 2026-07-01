@@ -516,12 +516,30 @@
         }
     }
 
+    // True when `offset` (s) falls inside the PCM the streaming worklet currently
+    // holds around its read frontier. Outside it — e.g. replaying from 0 after the
+    // song ended and the pump drained the window to the tail — the worklet would
+    // read silence, so the caller must refetch (repositionStream) first.
+    function streamOffsetBuffered(offset) {
+        if (!streaming || streamSampleRate <= 0) return true;
+        const posSamp = Math.round(offset * streamSampleRate);
+        const behind = Math.ceil(0.1 * streamSampleRate);
+        return posSamp >= lastWorkletPos - behind && posSamp <= jsWriteFrontier;
+    }
+
     function transportPlay() {
         resumeCtx();
         if (!buffersReady) { pendingPlay = true; return; }
         if (transport.playing) { flushPendingPlayResolvers(); return; }
         let offset = transportPlayhead();
         if (transport.duration > 0 && offset >= transport.duration - 0.001) offset = 0;
+        // Streaming: if the window doesn't cover this offset (replay from 0 after
+        // EOF, or the pump has drained), refetch from here before starting. The
+        // worklet stalls to silence until the refill reaches `offset`, then plays.
+        if (streaming && !streamOffsetBuffered(offset)) {
+            transport.baseOffset = offset;
+            repositionStream(offset);
+        }
         startSources(offset);
         // startSources may have skipped every stem (all exhausted at offset).
         // Only fire `play` if playback actually began.
@@ -1585,7 +1603,10 @@
 
     // Build the streaming graph + pump from the fetched WAV streams. `probeResp`
     // is stem[0]'s already-open response. Returns true once set up (the pump
-    // runs asynchronously), false on failure (teardown already ran).
+    // runs asynchronously), false on failure. On failure it does NOT teardown()
+    // (that would bump loadGeneration and hide the failure from onSongReady's
+    // supersession check) — the caller tears down + falls back. A `false` return
+    // with `gen === loadGeneration` is a real failure; a stale gen is supersession.
     async function setupStreaming(stems, probeResp, fullUrl, gen) {
         // 1. Open readers + parse headers for every stem (and the full mix).
         let restResps = [];
@@ -1595,8 +1616,7 @@
         } catch (e) {
             if (gen !== loadGeneration) return false;
             console.warn('[stems] stem fetch failed; cannot stream:', e);
-            teardown();
-            return false;
+            return false; // caller (onSongReady) tears down + falls back
         }
         if (gen !== loadGeneration) return false;
 
@@ -1613,7 +1633,7 @@
         const built = [];
         for (let i = 0; i < stems.length; i++) {
             const resp = responses[i];
-            if (!resp || !resp.body) { teardown(); return false; }
+            if (!resp || !resp.body) return false;
             const t = {
                 id: stems[i].id, url: stems[i].url, default: !!stems[i].default,
                 reader: resp.body.getReader(), leftover: EMPTY_BYTES, done: false, skipBytes: 0,
@@ -1621,7 +1641,7 @@
             };
             const hdr = await readWavHeader(t);
             if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
-            if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); teardown(); return false; }
+            if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); return false; }
             t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
             t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
             if (!streamSampleRate) streamSampleRate = hdr.sampleRate;
@@ -1645,7 +1665,7 @@
         }
 
         const maxStemFrames = built.reduce((m, t) => Math.max(m, t.totalFrames), 0);
-        if (maxStemFrames <= 0) { teardown(); return false; }
+        if (maxStemFrames <= 0) return false;
         streamTotalSamples = maxStemFrames;
 
         // 2. Pin the AudioContext to the source rate + (re)load the worklet.
@@ -1653,7 +1673,6 @@
         if (gen !== loadGeneration) return false;
         if (!okCtx || !ctx) {
             console.warn('[stems] could not run the AudioContext at the stem sample rate; not streaming');
-            teardown();
             return false;
         }
         useWorklet = true;
@@ -1692,7 +1711,6 @@
             workletNode.connect(masterGain);
         } catch (e) {
             console.warn('[stems] stem-mixer node failed; not streaming:', e);
-            teardown();
             return false;
         }
 
@@ -1748,7 +1766,6 @@
             });
         } catch (e) {
             console.warn('[stems] worklet open failed; not streaming:', e);
-            teardown();
             return false;
         }
         workletPostReady = true;
@@ -1891,12 +1908,15 @@
 
         if (probe && isWavResponse(probe)) {
             const ok = await setupStreaming(stems, probe, fullUrl, gen);
+            // setupStreaming does NOT teardown on failure, so a stale gen here is
+            // genuine supersession by a newer song (its overlay owns the screen).
             if (gen !== loadGeneration) return;
             if (!ok) {
+                // Real streaming-setup failure: tear the partial graph down (which
+                // reverts to core control) and resume core if the user wanted
+                // playback (degraded single track beats a silent, paused player).
+                teardown();
                 hideOverlay();
-                // Streaming setup failed → teardown reverted to core control.
-                // Resume core if the user wanted playback (degraded single track
-                // beats a silent, paused player).
                 if (wantedPlay) {
                     const c = document.getElementById('audio');
                     if (c) { try { const pr = c.play(); if (pr && pr.catch) pr.catch(() => {}); } catch (_) {} }
