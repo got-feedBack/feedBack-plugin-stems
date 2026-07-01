@@ -706,26 +706,44 @@
                 });
             } catch (e) { console.warn('[stems] duration shim install failed:', e); }
         }
+        // play/pause are installed with Object.defineProperty rather than a plain
+        // `core.play = fn` assignment. iOS WebKit exposes HTMLMediaElement.play /
+        // .pause as non-writable, so the assignment throws "Attempted to assign to
+        // readonly property" in this plugin's strict-mode (ES module) context —
+        // which left playOk/pauseOk false, so onSongReady() refused the takeover
+        // and the browser played only stems[0] (single stem, dead mixer sliders).
+        // Chromium/Electron silently allow the assignment, so this only bit on iOS.
+        // Defining an OWN property on the instance sidesteps the prototype's
+        // writability and works on both engines — matching the currentTime/paused/
+        // duration shims above, which already use defineProperty.
         try {
-            core.play = function () {
-                if (sloppakActive) {
-                    transportPlay();
-                    // Resolve immediately if playback actually started; otherwise
-                    // return a promise that settles when the deferred play starts
-                    // (or is cancelled), matching HTMLMediaElement.play()'s
-                    // "resolves once playback begins" contract.
-                    if (transport.playing || !pendingPlay) return Promise.resolve();
-                    return new Promise((resolve) => { pendingPlayResolvers.push(resolve); });
-                }
-                return coreNativePlay();
-            };
+            Object.defineProperty(core, 'play', {
+                configurable: true,
+                writable: true,
+                value: function () {
+                    if (sloppakActive) {
+                        transportPlay();
+                        // Resolve immediately if playback actually started; otherwise
+                        // return a promise that settles when the deferred play starts
+                        // (or is cancelled), matching HTMLMediaElement.play()'s
+                        // "resolves once playback begins" contract.
+                        if (transport.playing || !pendingPlay) return Promise.resolve();
+                        return new Promise((resolve) => { pendingPlayResolvers.push(resolve); });
+                    }
+                    return coreNativePlay();
+                },
+            });
             playOk = true;
         } catch (e) { console.warn('[stems] play shim install failed:', e); }
         try {
-            core.pause = function () {
-                if (sloppakActive) { transportPause(); return; }
-                return coreNativePause();
-            };
+            Object.defineProperty(core, 'pause', {
+                configurable: true,
+                writable: true,
+                value: function () {
+                    if (sloppakActive) { transportPause(); return; }
+                    return coreNativePause();
+                },
+            });
             pauseOk = true;
         } catch (e) { console.warn('[stems] pause shim install failed:', e); }
         // The slopsmith speed slider writes #audio.playbackRate; mirror it
