@@ -19,16 +19,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
 
 test('play/pause shims use defineProperty, not the assignment that throws on iOS', () => {
+    // Strip full-line comments first: the surrounding comment in screen.js
+    // literally reads "`core.play = fn` assignment" to explain the fix, and a
+    // naive assignment-pattern match would trip on that prose instead of code.
+    const codeOnly = src.replace(/^\s*\/\/.*$/gm, '');
     assert.ok(
-        !/\bcore\.play\s*=\s*function/.test(src),
-        'core.play must not be installed via direct assignment (throws on iOS WebKit)'
+        !/\bcore\.play\s*=(?!=)/.test(codeOnly),
+        'core.play must not be installed via assignment of any kind (throws on iOS WebKit)'
     );
     assert.ok(
-        !/\bcore\.pause\s*=\s*function/.test(src),
-        'core.pause must not be installed via direct assignment (throws on iOS WebKit)'
+        !/\bcore\.pause\s*=(?!=)/.test(codeOnly),
+        'core.pause must not be installed via assignment of any kind (throws on iOS WebKit)'
     );
-    assert.match(src, /Object\.defineProperty\(core, 'play'/, 'core.play must use Object.defineProperty');
-    assert.match(src, /Object\.defineProperty\(core, 'pause'/, 'core.pause must use Object.defineProperty');
+    assert.match(src, /Object\.defineProperty\(core,\s*["']play["']/, 'core.play must use Object.defineProperty');
+    assert.match(src, /Object\.defineProperty\(core,\s*["']pause["']/, 'core.pause must use Object.defineProperty');
 });
 
 test('defineProperty overrides a non-writable method where assignment throws (iOS WebKit model)', () => {
