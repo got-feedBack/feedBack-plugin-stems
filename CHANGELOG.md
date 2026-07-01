@@ -2,6 +2,23 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [0.7.1] — iOS stem playback fix
+
+### Fixed
+
+- **Stem mixer now works on iOS (iPhone/iPad).** The `#audio` takeover shims for
+  `play` / `pause` were installed with a direct `core.play = fn` assignment, which
+  iOS WebKit rejects with "Attempted to assign to readonly property" (those methods
+  are non-writable there, and the plugin runs as a strict-mode ES module). The
+  throw left the critical-shim gate `shimsUsable` false, so `onSongReady()` aborted
+  the sloppak takeover and handed playback back to the native `<audio>` element —
+  which plays only `stems[0]`. On-device this looked like "only one stem plays and
+  the mixer sliders do nothing." `play`/`pause` are now installed with
+  `Object.defineProperty` (an own property on the instance), matching the
+  currentTime/paused/duration shims and working on both WebKit and Chromium.
+  Desktop/Electron was unaffected. Discovered while running the plugin through the
+  native iOS client (`feedback-client-app`).
+
 ## [0.7.0] — Pristine full mix at unity
 
 ### Added
