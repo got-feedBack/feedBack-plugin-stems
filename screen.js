@@ -354,7 +354,21 @@
         } else if (msg.type === 'pos') {
             // Streaming backpressure: the worklet reports its read frontier so
             // the pump can top the bounded window up ahead of it.
-            if (typeof msg.pos === 'number') lastWorkletPos = msg.pos;
+            if (typeof msg.pos === 'number') {
+                lastWorkletPos = msg.pos;
+                // Re-baseline the transport clock to the worklet's AUTHORITATIVE
+                // read frontier. Without this, an under-run stall (worklet holds
+                // pos, main clock keeps advancing off AudioContext.currentTime)
+                // would leave the highway permanently ahead by the stall duration
+                // once audio resumes. Re-baselining every ~20 ms also freezes the
+                // highway during a stall (each urgent 'pos' resets it to the held
+                // pos), so it stays in sync. Steady playback is a near-no-op (both
+                // clocks track the audio clock at the same rate).
+                if (streaming && transport.playing && ctx && streamSampleRate > 0) {
+                    transport.baseOffset = msg.pos / streamSampleRate;
+                    transport.baseCtxTime = ctx.currentTime;
+                }
+            }
             if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
         }
     }
@@ -1644,7 +1658,18 @@
             if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); return false; }
             t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
             t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
-            if (!streamSampleRate) streamSampleRate = hdr.sampleRate;
+            // All stems must share one sample rate — the context is pinned to it
+            // and the worklet indexes every track by the same sample clock. A
+            // mixed-rate pack would play some stems at the wrong speed, so refuse
+            // to stream (the caller falls back). Demucs output is homogeneous;
+            // this is a defensive guard.
+            if (!streamSampleRate) {
+                streamSampleRate = hdr.sampleRate;
+            } else if (hdr.sampleRate !== streamSampleRate) {
+                console.warn('[stems] stem "' + t.id + '" rate ' + hdr.sampleRate
+                    + ' != ' + streamSampleRate + '; cannot stream a mixed-rate pack');
+                return false;
+            }
             built.push(t);
         }
 
@@ -1657,10 +1682,18 @@
             };
             const hdr = await readWavHeader(t);
             if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
-            if (hdr) {
+            // The full mix rides the same sample clock as the stems; the pristine
+            // mixdown can be encoded at the source rate (≠ the demucs stem rate),
+            // in which case it'd play at the wrong speed. Only keep it when its
+            // rate matches; otherwise drop it and play the separated stems.
+            if (hdr && hdr.sampleRate === streamSampleRate) {
                 t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
                 t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
                 fullTrack = t;
+            } else {
+                if (hdr) console.warn('[stems] original_audio rate '
+                    + hdr.sampleRate + ' != ' + streamSampleRate + '; using separated stems only');
+                try { t.reader.cancel(); } catch (_) {}
             }
         }
 
