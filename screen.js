@@ -1518,7 +1518,11 @@
     // preceding samples ourselves.
     async function openTrackStreams(fromSample, gen, token) {
         await Promise.all(streamTracks.map(async (t) => {
-            const headers = { Range: 'bytes=' + (44 + fromSample * t.byteAlign) + '-' };
+            // Byte offset of sample `fromSample` in this track's WAV (header +
+            // linear PCM). dataOffset is the parsed header size (44 for the
+            // proxy's canonical WAV, but honour a non-canonical one too).
+            const byteOffset = t.dataOffset + fromSample * t.byteAlign;
+            const headers = { Range: 'bytes=' + byteOffset + '-' };
             const resp = await fetch(t.url, { signal: abortController.signal, headers });
             if (gen !== loadGeneration || token !== streamSeekToken) {
                 try { resp.body && resp.body.cancel(); } catch (_) {}
@@ -1528,8 +1532,8 @@
             t.leftover = EMPTY_BYTES;
             t.done = false;
             // 206 → body already starts at fromSample (no header). 200 → whole
-            // file from 0; skip the 44-byte header + the preceding PCM.
-            t.skipBytes = (resp.status === 206) ? 0 : (44 + fromSample * t.byteAlign);
+            // file from 0; skip the header + the preceding PCM ourselves.
+            t.skipBytes = (resp.status === 206) ? 0 : byteOffset;
         }));
     }
 
@@ -1613,12 +1617,12 @@
             const t = {
                 id: stems[i].id, url: stems[i].url, default: !!stems[i].default,
                 reader: resp.body.getReader(), leftover: EMPTY_BYTES, done: false, skipBytes: 0,
-                nch: 2, byteAlign: 4, totalFrames: 0,
+                nch: 2, byteAlign: 4, totalFrames: 0, dataOffset: 44,
             };
             const hdr = await readWavHeader(t);
             if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
             if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); teardown(); return false; }
-            t.nch = hdr.nch; t.byteAlign = hdr.nch * 2;
+            t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
             t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
             if (!streamSampleRate) streamSampleRate = hdr.sampleRate;
             built.push(t);
@@ -1629,12 +1633,12 @@
             const t = {
                 id: '__full', url: fullUrl,
                 reader: fullResp.body.getReader(), leftover: EMPTY_BYTES, done: false, skipBytes: 0,
-                nch: 2, byteAlign: 4, totalFrames: 0,
+                nch: 2, byteAlign: 4, totalFrames: 0, dataOffset: 44,
             };
             const hdr = await readWavHeader(t);
             if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
             if (hdr) {
-                t.nch = hdr.nch; t.byteAlign = hdr.nch * 2;
+                t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
                 t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
                 fullTrack = t;
             }
@@ -1713,15 +1717,24 @@
         });
 
         // 5. Transport + initial gains, then open the worklet window.
+        // Preserve any playhead seeded before/while setting up — the core-playback
+        // takeover (core was already playing stem[0]) or a seek during setup left
+        // it on transport.baseOffset. Start the window there instead of 0; the
+        // tracks' readers begin at PCM sample 0, so skip forward to the offset.
         transport.duration = streamTotalSamples / streamSampleRate;
-        transport.baseOffset = 0;
+        const initialOffsetSamples = Math.max(0, Math.min(
+            Math.round((transport.baseOffset || 0) * streamSampleRate), streamTotalSamples));
+        transport.baseOffset = initialOffsetSamples / streamSampleRate;
         transport.baseCtxTime = 0;
         transport.playing = false;
         const core = document.getElementById('audio');
         const coreRate = core ? Number(core.playbackRate) : 1;
         transport.rate = (Number.isFinite(coreRate) && coreRate > 0) ? coreRate : 1;
-        jsWriteFrontier = 0;
-        lastWorkletPos = 0;
+        jsWriteFrontier = initialOffsetSamples;
+        lastWorkletPos = initialOffsetSamples;
+        if (initialOffsetSamples > 0) {
+            for (const t of streamTracks) t.skipBytes = initialOffsetSamples * t.byteAlign;
+        }
 
         const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
         const gains = stemGains.slice();
@@ -1731,7 +1744,7 @@
             workletNode.port.postMessage({
                 type: 'open', tracks: openTracks, gains,
                 sampleRate: streamSampleRate, cap: Math.ceil(STREAM_CAP_SEC * streamSampleRate),
-                startSample: 0,
+                startSample: initialOffsetSamples,
             });
         } catch (e) {
             console.warn('[stems] worklet open failed; not streaming:', e);
