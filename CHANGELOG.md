@@ -2,6 +2,48 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [0.8.0] — Bounded-memory streaming (fixes the iOS 6-stem crash)
+
+### Fixed
+
+- **6-stem sloppaks no longer crash iOS/iPadOS.** Previously every stem was
+  decoded to a full-length Float32 `AudioBuffer` up front (~500–650 MB for a
+  6-stem, 4-minute song), which jettisoned the WKWebView content process the
+  moment decode reached 6/6 — the app "crashed"/reloaded to the library.
+  Playback memory is now **bounded to a few-second window per track,
+  independent of song length and stem count** (~8 MB vs ~645 MB), at full
+  quality (no downsampling / lossy re-encode).
+
+### Changed
+
+- **Streaming playback path.** The iOS client proxy already transcodes each OGG
+  stem to RIFF/WAV (16-bit PCM) and streams it. The plugin now reads that PCM
+  incrementally off `fetch().body` and feeds the time-stretch worklet's bounded
+  ring buffer, dropping consumed PCM as playback advances. Because raw PCM is
+  sliceable at any sample, **no decoder / WebCodecs / demuxer is needed**, and
+  there is no iOS-version floor beyond `AudioWorklet` + fetch streams. The
+  worklet's WSOLA pitch-preserving speed, sample-locked mix, per-stem
+  gain/mute, unity full-mix routing, analyser hand-off, karaoke and
+  default-muted behaviour are all unchanged.
+
+  - **Feature-detected, content-driven.** Streaming engages only when a stem is
+    served as `audio/wav`; desktop/Electron (served `audio/ogg`, a container
+    that can't be sliced) keeps the existing full-decode path byte-for-byte.
+  - **Sample-accurate seek.** A seek flushes the window and refetches every
+    stem from the target so the stems stay phase-aligned. The plugin sends an
+    HTTP `Range` request and uses a `206` response for O(1) seeks when the proxy
+    supports it, falling back to re-streaming from the start (still exact, just
+    slower over LAN) when it does not.
+  - **Sample-rate pinning.** The `AudioContext` is run at the stems' native rate
+    (the OS resamples to the device) so the streamed PCM feeds the worklet
+    sample-exact with no in-JS resample.
+  - **Backpressure + under-run safety.** The worklet reports its read frontier so
+    the pump keeps ~2 s buffered ahead; if the network can't keep up the worklet
+    stalls to silence (never reads unwritten PCM, never signals a false end) and
+    resumes cleanly once fed. During such a stall the note highway (clocked off
+    the `AudioContext`) can drift briefly ahead of the audio until the buffer
+    refills — expected over a slow link, negligible on a LAN.
+
 ## [0.7.1] — iOS stem playback fix
 
 ### Fixed

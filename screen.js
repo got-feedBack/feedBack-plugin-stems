@@ -351,6 +351,11 @@
             updateLatencyOffset();
         } else if (msg.type === 'ended') {
             handleNaturalEnd();
+        } else if (msg.type === 'pos') {
+            // Streaming backpressure: the worklet reports its read frontier so
+            // the pump can top the bounded window up ahead of it.
+            if (typeof msg.pos === 'number') lastWorkletPos = msg.pos;
+            if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
         }
     }
 
@@ -540,7 +545,14 @@
         let target = Number(t);
         if (!Number.isFinite(target)) return;
         target = Math.max(0, dur > 0 ? Math.min(target, dur) : target);
-        if (useWorklet) {
+        if (streaming) {
+            // Streaming: flush the bounded window and refetch every track from
+            // the target (repositionStream posts the worklet 'seek'). Re-baseline
+            // the clock; works whether or not we're currently playing.
+            transport.baseOffset = target;
+            transport.baseCtxTime = ctx ? ctx.currentTime : 0;
+            repositionStream(target);
+        } else if (useWorklet) {
             // Tell the worklet to move its read pointer and flush WSOLA state
             // so no stale stretched audio bleeds across the seek. Re-baseline
             // the clock; works whether or not we're currently playing.
@@ -793,6 +805,9 @@
             try { abortController.abort(); } catch (_) {}
             abortController = null;
         }
+        // Stop the streaming pump + cancel its readers (aborting the fetches
+        // above already rejects in-flight reads; this also clears state).
+        resetStreamState();
         loadGeneration++;
         buffersReady = false;
         pendingPlay = false;
@@ -1263,6 +1278,488 @@
         return true;
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  Streaming (bounded-memory) playback — the iOS WAV path
+    //
+    //  The iOS client proxy transcodes each OGG stem to RIFF/WAV (16-bit PCM)
+    //  and streams it. Decoding whole stems to AudioBuffers (buildGraphFromBuffers
+    //  above) jettisons the WKWebView content process at ~6 stems (~500 MB). Here
+    //  we read the PCM incrementally off fetch().body and feed the worklet's
+    //  bounded ring via 'append', dropping consumed PCM, so peak memory is a
+    //  few-second window per track — independent of song length or stem count.
+    //  Raw PCM is sliceable at any sample, so NO decoder/WebCodecs/demuxer is
+    //  needed. Desktop (audio/ogg, not sliceable) keeps the full-decode path.
+    // ══════════════════════════════════════════════════════════════════════
+    const STREAM_AHEAD_SEC = 2.0;      // keep ~this far buffered ahead of pos
+    const STREAM_PREFILL_SEC = 0.5;    // buffer this much before starting
+    const STREAM_CAP_SEC = 3.5;        // worklet per-track window capacity
+    const STREAM_CHUNK_FRAMES = 8192;  // max frames appended per pump round
+    const EMPTY_BYTES = new Uint8Array(0);
+
+    let streaming = false;             // this song is using the streaming path
+    let streamTracks = [];             // [{ url, nch, byteAlign, totalFrames, reader, leftover, done, skipBytes }]
+    let streamSampleRate = 0;
+    let streamTotalSamples = 0;        // transport length in samples (max stem)
+    let jsWriteFrontier = 0;           // next absolute sample the pump will append
+    let pumpStop = false;
+    let lastWorkletPos = 0;            // worklet read frontier (samples), via 'pos'
+    let posWaiter = null;              // resolve fn for a pump await on next 'pos'
+    let streamSeekToken = 0;           // invalidates a superseded seek refetch
+
+    function streamingSupported() {
+        return typeof ReadableStream !== 'undefined'
+            && typeof fetch === 'function'
+            && typeof AudioWorkletNode !== 'undefined';
+    }
+    function isWavResponse(resp) {
+        try {
+            const ct = ((resp && resp.headers && resp.headers.get('content-type')) || '').toLowerCase();
+            return ct.indexOf('wav') !== -1;
+        } catch (_) { return false; }
+    }
+
+    // --- parseWavHeader (pure; node-testable, see tests/wav-parse.test.mjs) ---
+    // Parse a RIFF/WAV header from the leading bytes; returns
+    // { nch, sampleRate, bitsPerSample, dataOffset, dataSize } or null. Only
+    // 16-bit PCM is accepted (what the proxy emits). Chunk-walks fmt/data so a
+    // non-canonical header (extra chunks before `data`) still parses.
+    function parseWavHeader(u8) {
+        if (!u8 || u8.length < 44) return null;
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.length);
+        const tag = (o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+        if (tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return null;
+        let off = 12, fmt = null, dataOffset = -1, dataSize = 0;
+        while (off + 8 <= u8.length) {
+            const id = tag(off);
+            const size = dv.getUint32(off + 4, true);
+            const body = off + 8;
+            if (id === 'fmt ' && body + 16 <= u8.length) {
+                fmt = {
+                    audioFormat: dv.getUint16(body, true),
+                    nch: dv.getUint16(body + 2, true),
+                    sampleRate: dv.getUint32(body + 4, true),
+                    bitsPerSample: dv.getUint16(body + 14, true),
+                };
+            } else if (id === 'data') {
+                dataOffset = body;
+                dataSize = size;
+                break; // PCM starts here
+            }
+            off = body + size + (size & 1); // chunks are word-aligned
+        }
+        if (!fmt || dataOffset < 0) return null;
+        if (fmt.bitsPerSample !== 16 || fmt.nch < 1 || fmt.sampleRate <= 0) return null;
+        return { nch: fmt.nch, sampleRate: fmt.sampleRate, bitsPerSample: 16, dataOffset, dataSize };
+    }
+    // --- end parseWavHeader ---
+
+    // --- pcm16ToFloat32 (pure; node-testable, see tests/pcm-convert.test.mjs) ---
+    // De-interleave `frames` of 16-bit little-endian PCM starting at byte
+    // `byteOffset` in `u8` into one Float32Array(frames) per channel, [-1, 1).
+    // Reads that run past the buffer are treated as 0 (silence pad).
+    function pcm16ToFloat32(u8, byteOffset, frames, nch) {
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.length);
+        const limit = u8.length;
+        const chans = [];
+        for (let ch = 0; ch < nch; ch++) chans.push(new Float32Array(frames));
+        let p = byteOffset;
+        for (let f = 0; f < frames; f++) {
+            for (let ch = 0; ch < nch; ch++) {
+                chans[ch][f] = (p + 2 <= limit) ? dv.getInt16(p, true) / 32768 : 0;
+                p += 2;
+            }
+        }
+        return chans;
+    }
+    // --- end pcm16ToFloat32 ---
+
+    // Pull one chunk from a track's reader into its leftover byte buffer.
+    async function trackRead(t) {
+        if (t.done) return false;
+        const { done, value } = await t.reader.read();
+        if (done) { t.done = true; return false; }
+        if (value && value.length) {
+            if (t.leftover.length === 0) {
+                t.leftover = value;
+            } else {
+                const merged = new Uint8Array(t.leftover.length + value.length);
+                merged.set(t.leftover, 0);
+                merged.set(value, t.leftover.length);
+                t.leftover = merged;
+            }
+        }
+        return true;
+    }
+    async function ensureBytes(t, n) {
+        while (t.leftover.length < n && !t.done) await trackRead(t);
+        return t.leftover.length >= n;
+    }
+    async function dropBytes(t, n) {
+        while (n > 0) {
+            if (t.leftover.length === 0) { if (!(await trackRead(t))) break; }
+            if (t.leftover.length === 0) break;
+            const take = Math.min(n, t.leftover.length);
+            t.leftover = t.leftover.subarray(take);
+            n -= take;
+        }
+    }
+
+    // Read the WAV header off a freshly opened track reader, parse it, and trim
+    // `leftover` to the start of the PCM body. Returns the header or null.
+    async function readWavHeader(t) {
+        let header = parseWavHeader(t.leftover);
+        while (!header && !t.done && t.leftover.length < (1 << 16)) {
+            await trackRead(t);
+            header = parseWavHeader(t.leftover);
+        }
+        if (!header) return null;
+        t.leftover = t.leftover.subarray(header.dataOffset);
+        return header;
+    }
+
+    // Dequeue `frames` per-channel samples of real PCM from a track (reading
+    // from its reader as needed), returning one Float32Array(frames) per channel.
+    async function dequeueTrackFrames(t, frames) {
+        if (t.skipBytes > 0) { await dropBytes(t, t.skipBytes); t.skipBytes = 0; }
+        const wantBytes = frames * t.byteAlign;
+        await ensureBytes(t, wantBytes);
+        const availBytes = Math.min(wantBytes, t.leftover.length);
+        const availFrames = Math.floor(availBytes / t.byteAlign);
+        const chunk = t.leftover.subarray(0, availFrames * t.byteAlign);
+        t.leftover = t.leftover.subarray(availFrames * t.byteAlign);
+        return pcm16ToFloat32(chunk, 0, frames, t.nch); // pads past availFrames with 0
+    }
+
+    // Append one aligned block for every track at the current write frontier,
+    // reading PCM as needed and zero-padding tracks past their own end.
+    async function appendRound() {
+        const remaining = streamTotalSamples - jsWriteFrontier;
+        if (remaining <= 0) return false;
+        const aheadTarget = Math.min(streamTotalSamples,
+            lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * streamSampleRate));
+        const frames = Math.min(STREAM_CHUNK_FRAMES, remaining, Math.max(0, aheadTarget - jsWriteFrontier));
+        if (frames <= 0) return false;
+
+        const blocks = [];
+        const transfer = [];
+        for (const t of streamTracks) {
+            const realWanted = Math.max(0, Math.min(frames, t.totalFrames - jsWriteFrontier));
+            let chans;
+            if (realWanted <= 0) {
+                chans = [];
+                for (let ch = 0; ch < t.nch; ch++) chans.push(new Float32Array(frames));
+            } else {
+                // dequeueTrackFrames pads to `realWanted`; pad the rest to `frames`.
+                chans = await dequeueTrackFrames(t, realWanted);
+                if (realWanted < frames) {
+                    for (let ch = 0; ch < t.nch; ch++) {
+                        const full = new Float32Array(frames);
+                        full.set(chans[ch], 0);
+                        chans[ch] = full;
+                    }
+                }
+            }
+            for (const c of chans) transfer.push(c.buffer);
+            blocks.push({ channels: chans });
+        }
+        if (pumpStop || !workletNode) return false;
+        try {
+            workletNode.port.postMessage({ type: 'append', base: jsWriteFrontier, frames, tracks: blocks }, transfer);
+        } catch (_) { return false; }
+        jsWriteFrontier += frames;
+        return true;
+    }
+
+    // Await the worklet's next backpressure ('pos') message, or a short timeout.
+    function waitPos() {
+        return new Promise((resolve) => {
+            posWaiter = resolve;
+            setTimeout(() => { if (posWaiter === resolve) { posWaiter = null; resolve(); } }, 100);
+        });
+    }
+
+    // The pump: keep the worklet window ~STREAM_AHEAD_SEC ahead of its read
+    // frontier. On the initial run, prefill then start (honouring pending play).
+    async function runPump(isInitial) {
+        try {
+            const prefillTo = Math.min(streamTotalSamples,
+                jsWriteFrontier + Math.ceil(STREAM_PREFILL_SEC * streamSampleRate));
+            while (!pumpStop && jsWriteFrontier < prefillTo) {
+                if (!(await appendRound())) break;
+            }
+            if (pumpStop) return;
+            if (isInitial) {
+                buffersReady = true;
+                if (pendingPlay) { pendingPlay = false; transportPlay(); }
+            }
+            while (!pumpStop && jsWriteFrontier < streamTotalSamples) {
+                const target = Math.min(streamTotalSamples,
+                    lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * streamSampleRate));
+                if (jsWriteFrontier >= target) { await waitPos(); continue; }
+                if (!(await appendRound())) break;
+            }
+        } catch (e) {
+            if (!pumpStop && (!e || e.name !== 'AbortError')) console.warn('[stems] stream pump error:', e);
+        }
+    }
+
+    function cancelStreamReaders() {
+        for (const t of streamTracks) {
+            try { t.reader && t.reader.cancel(); } catch (_) {}
+            t.reader = null;
+            t.leftover = EMPTY_BYTES;
+            t.done = true;
+        }
+    }
+
+    // (Re)open every track's byte stream starting at `fromSample`. Uses a Range
+    // request: a 206-capable proxy serves pure PCM from there (efficient seek);
+    // a proxy that ignores Range returns 200 from 0, so we skip the header +
+    // preceding samples ourselves.
+    async function openTrackStreams(fromSample, gen, token) {
+        await Promise.all(streamTracks.map(async (t) => {
+            const headers = { Range: 'bytes=' + (44 + fromSample * t.byteAlign) + '-' };
+            const resp = await fetch(t.url, { signal: abortController.signal, headers });
+            if (gen !== loadGeneration || token !== streamSeekToken) {
+                try { resp.body && resp.body.cancel(); } catch (_) {}
+                return;
+            }
+            t.reader = resp.body.getReader();
+            t.leftover = EMPTY_BYTES;
+            t.done = false;
+            // 206 → body already starts at fromSample (no header). 200 → whole
+            // file from 0; skip the 44-byte header + the preceding PCM.
+            t.skipBytes = (resp.status === 206) ? 0 : (44 + fromSample * t.byteAlign);
+        }));
+    }
+
+    // Streaming seek: flush the worklet window, refetch every track from the
+    // target, and resume the pump. Sample-accurate; O(1) network with a
+    // 206-capable proxy, O(offset) discard otherwise.
+    async function repositionStream(targetSec) {
+        const token = ++streamSeekToken;
+        const gen = loadGeneration;
+        pumpStop = true;
+        cancelStreamReaders();
+        const Tsamp = Math.max(0, Math.round(targetSec * streamSampleRate));
+        if (workletNode) {
+            try { workletNode.port.postMessage({ type: 'seek', offset: Tsamp / streamSampleRate }); } catch (_) {}
+        }
+        jsWriteFrontier = Tsamp;
+        lastWorkletPos = Tsamp;
+        try {
+            await openTrackStreams(Tsamp, gen, token);
+        } catch (e) {
+            if (token === streamSeekToken && (!e || e.name !== 'AbortError')) {
+                console.warn('[stems] seek refetch failed:', e);
+            }
+            return;
+        }
+        if (token !== streamSeekToken || gen !== loadGeneration) return;
+        pumpStop = false;
+        runPump(false);
+    }
+
+    // Recreate the AudioContext at `rate` when it differs, so streamed PCM feeds
+    // the worklet at its native rate (the OS resamples to the device) — no in-JS
+    // resample, and the worklet stays sample-exact. Re-registers the worklet
+    // module on the new context. Returns true if the context is usable at `rate`.
+    async function ensureCtxAtRate(rate) {
+        ensureCtx();
+        if (ctx && Math.abs(ctx.sampleRate - rate) < 1) return true;
+        try { if (ctx) { const old = ctx; ctx = null; try { old.close(); } catch (_) {} } } catch (_) {}
+        workletReady = false;
+        workletModulePromise = null;
+        const AC = window.AudioContext || window.webkitAudioContext;
+        try { ctx = new AC({ sampleRate: rate }); }
+        catch (_) { try { ctx = new AC(); } catch (__) { return false; } }
+        const ok = await ensureWorklet();
+        // If the engine ignored the sampleRate option, we can't feed native-rate
+        // PCM without resampling — refuse streaming and let the caller bail.
+        return ok && !!ctx && Math.abs(ctx.sampleRate - rate) < 1;
+    }
+
+    // Build the streaming graph + pump from the fetched WAV streams. `probeResp`
+    // is stem[0]'s already-open response. Returns true once set up (the pump
+    // runs asynchronously), false on failure (teardown already ran).
+    async function setupStreaming(stems, probeResp, fullUrl, gen) {
+        // 1. Open readers + parse headers for every stem (and the full mix).
+        let restResps = [];
+        try {
+            restResps = await Promise.all(stems.slice(1).map((s) =>
+                fetch(s.url, { signal: abortController.signal, headers: { Range: 'bytes=0-' } })));
+        } catch (e) {
+            if (gen !== loadGeneration) return false;
+            console.warn('[stems] stem fetch failed; cannot stream:', e);
+            teardown();
+            return false;
+        }
+        if (gen !== loadGeneration) return false;
+
+        let fullResp = null;
+        if (fullUrl) {
+            try {
+                const fr = await fetch(fullUrl, { signal: abortController.signal, headers: { Range: 'bytes=0-' } });
+                if (gen !== loadGeneration) { try { fr.body && fr.body.cancel(); } catch (_) {} return false; }
+                if (isWavResponse(fr)) fullResp = fr; else { try { fr.body && fr.body.cancel(); } catch (_) {} }
+            } catch (_) { /* no full mix → separated stems only */ }
+        }
+
+        const responses = [probeResp].concat(restResps);
+        const built = [];
+        for (let i = 0; i < stems.length; i++) {
+            const resp = responses[i];
+            if (!resp || !resp.body) { teardown(); return false; }
+            const t = {
+                id: stems[i].id, url: stems[i].url, default: !!stems[i].default,
+                reader: resp.body.getReader(), leftover: EMPTY_BYTES, done: false, skipBytes: 0,
+                nch: 2, byteAlign: 4, totalFrames: 0,
+            };
+            const hdr = await readWavHeader(t);
+            if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
+            if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); teardown(); return false; }
+            t.nch = hdr.nch; t.byteAlign = hdr.nch * 2;
+            t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
+            if (!streamSampleRate) streamSampleRate = hdr.sampleRate;
+            built.push(t);
+        }
+
+        let fullTrack = null;
+        if (fullResp && fullResp.body) {
+            const t = {
+                id: '__full', url: fullUrl,
+                reader: fullResp.body.getReader(), leftover: EMPTY_BYTES, done: false, skipBytes: 0,
+                nch: 2, byteAlign: 4, totalFrames: 0,
+            };
+            const hdr = await readWavHeader(t);
+            if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
+            if (hdr) {
+                t.nch = hdr.nch; t.byteAlign = hdr.nch * 2;
+                t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
+                fullTrack = t;
+            }
+        }
+
+        const maxStemFrames = built.reduce((m, t) => Math.max(m, t.totalFrames), 0);
+        if (maxStemFrames <= 0) { teardown(); return false; }
+        streamTotalSamples = maxStemFrames;
+
+        // 2. Pin the AudioContext to the source rate + (re)load the worklet.
+        const okCtx = await ensureCtxAtRate(streamSampleRate);
+        if (gen !== loadGeneration) return false;
+        if (!okCtx || !ctx) {
+            console.warn('[stems] could not run the AudioContext at the stem sample rate; not streaming');
+            teardown();
+            return false;
+        }
+        useWorklet = true;
+
+        // 3. Full-mix tolerance (same rule as buildGraphFromBuffers): only keep
+        //    it when its length matches the stems, clamped so it can't extend the
+        //    song past where the stems / highway end.
+        fullTrackIndex = -1;
+        streamTracks = built.slice();
+        if (fullTrack) {
+            const tol = Math.max(2048, Math.round(0.05 * streamSampleRate));
+            if (Math.abs(fullTrack.totalFrames - maxStemFrames) > tol) {
+                console.warn('[stems] original_audio length off by '
+                    + (fullTrack.totalFrames - maxStemFrames) + ' frames; using separated stems only.');
+                try { fullTrack.reader.cancel(); } catch (_) {}
+            } else {
+                fullTrack.totalFrames = Math.min(fullTrack.totalFrames, maxStemFrames);
+                streamTracks.push(fullTrack);
+                fullTrackIndex = built.length;
+            }
+        }
+
+        // 4. Mix graph + stem UI state (mirrors buildGraphFromBuffers, no buffers).
+        masterGain = ctx.createGain();
+        masterGain.gain.value = persistedSongGain();
+        masterGain.connect(ctx.destination);
+        analyserNode = ctx.createAnalyser();
+        analyserNode.fftSize = 256;
+        masterGain.connect(analyserNode);
+        workletPostReady = false;
+        try {
+            workletNode = new AudioWorkletNode(ctx, 'stem-mixer', {
+                numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+            });
+            workletNode.port.onmessage = onWorkletMessage;
+            workletNode.connect(masterGain);
+        } catch (e) {
+            console.warn('[stems] stem-mixer node failed; not streaming:', e);
+            teardown();
+            return false;
+        }
+
+        const karaoke = karaokeDefault();
+        const defaultMuted = loadDefaultMuted();
+        const savedMuted = loadMuted(currentFilename);
+        const savedVols = loadVolumes(currentFilename);
+        stemState = built.map((t, i) => {
+            const gain = makeStemGainHandle(i);
+            let on;
+            if (savedMuted) {
+                on = !savedMuted.has(t.id);
+            } else {
+                on = !!t.default;
+                if (defaultMuted.has(t.id)) on = false;
+                if (karaoke && /vocal/i.test(t.id)) on = false;
+            }
+            const vol = clampVolume(savedVols[t.id]);
+            const initialVol = vol == null ? 1 : vol;
+            gain.gain.value = on ? initialVol : 0;
+            return { id: t.id, url: t.url, default: t.default, buffer: null, source: null, gain, on, vol: initialVol };
+        });
+
+        // 5. Transport + initial gains, then open the worklet window.
+        transport.duration = streamTotalSamples / streamSampleRate;
+        transport.baseOffset = 0;
+        transport.baseCtxTime = 0;
+        transport.playing = false;
+        const core = document.getElementById('audio');
+        const coreRate = core ? Number(core.playbackRate) : 1;
+        transport.rate = (Number.isFinite(coreRate) && coreRate > 0) ? coreRate : 1;
+        jsWriteFrontier = 0;
+        lastWorkletPos = 0;
+
+        const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+        const gains = stemGains.slice();
+        if (fullTrackIndex >= 0) gains.push(fullGain);
+        const openTracks = streamTracks.map((t) => ({ nch: t.nch, length: t.totalFrames }));
+        try {
+            workletNode.port.postMessage({
+                type: 'open', tracks: openTracks, gains,
+                sampleRate: streamSampleRate, cap: Math.ceil(STREAM_CAP_SEC * streamSampleRate),
+                startSample: 0,
+            });
+        } catch (e) {
+            console.warn('[stems] worklet open failed; not streaming:', e);
+            teardown();
+            return false;
+        }
+        workletPostReady = true;
+        updateLatencyOffset();
+
+        pumpStop = false; // teardown() set this true; clear it before pumping
+        streaming = true;
+        runPump(true); // async — prefills, then starts on pending play
+        return true;
+    }
+
+    function resetStreamState() {
+        pumpStop = true;
+        streamSeekToken++;
+        cancelStreamReaders();
+        streamTracks = [];
+        streaming = false;
+        streamSampleRate = 0;
+        streamTotalSamples = 0;
+        jsWriteFrontier = 0;
+        lastWorkletPos = 0;
+        if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
+    }
+
     // ── Song-fader bridge ──
     // audio-mixer.js's "Song" fader probes window.slopsmith.stems.setMasterVolume
     // and routes itself there when present, so the fader can drive every stem
@@ -1358,6 +1855,50 @@
         // separated-stems playback (loadFullMix returns null).
         const fullUrl = (useWorklet && info && info.has_original_audio) ? info.original_audio_url : null;
 
+        // Probe stem[0] to choose the path by Content-Type: the iOS proxy serves
+        // `audio/wav` (raw PCM — streamable, bounded memory); desktop serves
+        // `audio/ogg` (a container — keep the full-decode path). Streaming also
+        // needs the worklet + fetch ReadableStream. The Range header lets a
+        // 206-capable proxy serve efficiently; the current proxy/desktop returns
+        // a full 200, which streams fine.
+        let probe = null;
+        if (useWorklet && streamingSupported()) {
+            try {
+                probe = await fetch(stems[0].url, { signal: abortController.signal, headers: { Range: 'bytes=0-' } });
+            } catch (e) {
+                if (gen !== loadGeneration) return;
+                probe = null;
+            }
+            if (gen !== loadGeneration) { try { probe && probe.body && probe.body.cancel(); } catch (_) {} return; }
+        }
+
+        // Capture play intent before graph build — a build failure runs
+        // teardown(), which clears pendingPlay.
+        const wantedPlay = pendingPlay;
+
+        if (probe && isWavResponse(probe)) {
+            const ok = await setupStreaming(stems, probe, fullUrl, gen);
+            if (gen !== loadGeneration) return;
+            if (!ok) {
+                hideOverlay();
+                // Streaming setup failed → teardown reverted to core control.
+                // Resume core if the user wanted playback (degraded single track
+                // beats a silent, paused player).
+                if (wantedPlay) {
+                    const c = document.getElementById('audio');
+                    if (c) { try { const pr = c.play(); if (pr && pr.catch) pr.catch(() => {}); } catch (_) {} }
+                }
+                return;
+            }
+            hideOverlay();
+            injectUI();
+            installSongFaderBridge();
+            // buffersReady + pending-play are handled by the streaming pump.
+            return;
+        }
+        // Not streamable (desktop OGG, or streaming unsupported): full-decode.
+        try { probe && probe.body && probe.body.cancel(); } catch (_) {}
+
         let results, fullBuf = null;
         try {
             [results, fullBuf] = await Promise.all([
@@ -1373,9 +1914,6 @@
         if (gen !== loadGeneration) return;
         if (results === null) { hideOverlay(); return; }
 
-        // Capture play intent before buildGraphFromBuffers — on failure it runs
-        // teardown(), which clears pendingPlay.
-        const wantedPlay = pendingPlay;
         if (!buildGraphFromBuffers(results, fullBuf)) {
             hideOverlay();
             // No stems decoded: teardown() inside buildGraphFromBuffers reverted
