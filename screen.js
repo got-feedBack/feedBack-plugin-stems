@@ -1948,9 +1948,16 @@
             // genuine supersession by a newer song (its overlay owns the screen).
             if (gen !== loadGeneration) return;
             if (!ok) {
-                // Real streaming-setup failure: tear the partial graph down (which
-                // reverts to core control) and resume core if the user wanted
-                // playback (degraded single track beats a silent, paused player).
+                // Real streaming-setup failure. We deliberately do NOT fall back to
+                // the full-decode path here: streaming is only selected for
+                // audio/wav (the iOS proxy), and full-decoding 6 stems is the exact
+                // ~500 MB OOM this path exists to avoid. The common failure modes
+                // (AudioContext can't be pinned to the WAV rate, worklet
+                // construction fails) are device-wide, so full-decode would crash
+                // every large pack on such a device. Tear the partial graph down
+                // (reverts to core control) and resume core if the user wanted
+                // playback — degraded single-track audio beats a crash or a silent,
+                // paused player.
                 teardown();
                 hideOverlay();
                 if (wantedPlay) {
