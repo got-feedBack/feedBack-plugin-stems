@@ -89,6 +89,24 @@ pitch to tempo as before; a one-time console warning is logged.
 
 The DSP has a headless test: `node tests/stretch-worklet.test.mjs`.
 
+### Bounded-memory streaming (iOS)
+
+Decoding six full stems to `AudioBuffer`s up front costs ~500 MB and jettisons
+the WKWebView content process on iOS. When a stem is served as raw PCM
+(`audio/wav` — the iOS client proxy transcodes OGG→WAV and streams it), the
+plugin instead **streams the PCM off `fetch().body` into the worklet's bounded
+ring buffer**, dropping consumed samples so peak memory is a few-second window
+per track regardless of song length or stem count. Raw PCM is sliceable at any
+sample, so no decoder/WebCodecs/demuxer is needed. Seeks flush the window and
+refetch each stem from the target (using an HTTP `Range`/`206` when the proxy
+supports it, else re-streaming from the start); the `AudioContext` is pinned to
+the stems' sample rate so no in-JS resample is needed. Desktop (served
+`audio/ogg`, which can't be sliced) keeps the full-decode path above.
+
+Streaming is feature-detected by response `Content-Type`. The pure helpers
+(`parseWavHeader`, `pcm16ToFloat32`) and the worklet's ring/under-run behaviour
+have headless tests (`node --test`).
+
 ## Requirements
 
 Requires Slopsmith with `.sloppak` format support and a `song_info` payload that includes a `stems[]` array (available on the `feature/sloppak-format` branch and its merged descendants).
