@@ -2,6 +2,22 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [0.8.1] — Stem buttons wrap inside the v3 plugin-controls popover
+
+### Fixed
+
+- **Stem buttons no longer overflow the v3 "Plugin controls" rail popover.**
+  The mixer bar (`#stems-mixer`) is a horizontal flex row built for v2's wide
+  `#player-controls` bar. In v3 the host re-homes it into the narrow rail
+  popover (`.v3-rail-pop`, `max-width: 340px`), where the six stem buttons
+  (`min-width: 46px` each) exceeded the bubble's inner width and spilled past
+  its right edge — the popover's own `flex-wrap` can't help because the whole
+  mixer is a single child of the slot. The bar now sets `flex-wrap: wrap` on
+  itself so the buttons wrap onto additional lines inside the popover. Inert in
+  v2 (nothing to wrap in the wide bar); applied as an inline style since this
+  plugin ships no compiled stylesheet and can't rely on `flex-wrap` being in
+  core's scanned Tailwind CSS.
+
 ## [0.8.0] — Bounded-memory streaming (fixes the iOS 6-stem crash)
 
 ### Fixed

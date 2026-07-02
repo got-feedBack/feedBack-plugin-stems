@@ -926,7 +926,13 @@
         container = document.createElement('div');
         container.id = 'stems-mixer';
         container.className = 'flex items-center gap-1.5';
-        container.style.cssText = 'padding:0 6px;border-left:1px solid #2a2a3e;margin-left:4px;';
+        // flex-wrap so the stem buttons wrap onto a new line instead of
+        // overflowing when the host re-homes this bar into the narrow v3
+        // "Plugin controls" rail popover (.v3-rail-pop, max-width 340px).
+        // Inert in v2's wide #player-controls bar (nothing to wrap there);
+        // inline (not a Tailwind class) since this plugin ships no compiled
+        // stylesheet and can't rely on flex-wrap being in core's scanned CSS.
+        container.style.cssText = 'flex-wrap:wrap;padding:0 6px;border-left:1px solid #2a2a3e;margin-left:4px;';
 
         const label = document.createElement('span');
         label.textContent = 'Stems';
