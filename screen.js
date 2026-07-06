@@ -492,6 +492,26 @@
         dispatchAudioEvent('pause');
     }
 
+    // A user STOP is NOT a song end. Core emits `playback:stopped` from its
+    // _stop command handler (static/capabilities/playback.js:880) on a manual
+    // STOP — a `stop` is a user-priority action, distinct from `playback:ended`
+    // which core only emits at genuine song end (transportEvent('ended') <-
+    // song:ended bridge, playback.js:1018/1074). A manual stop must therefore
+    // NOT destroy the stem graph: the session can resume. Halt our sources and
+    // freeze the playhead, but PRESERVE the decoded buffers, gain graph and
+    // mixer UI so a resume/replay re-locks instantly instead of re-fetching.
+    // Full teardown() stays reserved for playback:ended and the new-song-load /
+    // screen-leave paths.
+    function lightStop() {
+        pendingPlay = false;
+        flushPendingPlayResolvers();
+        if (!transport.playing) return;
+        const ph = transportPlayhead();
+        stopSources();
+        transport.baseOffset = ph;
+        transport.playing = false;
+    }
+
     function transportSeek(t) {
         const dur = transport.duration;
         let target = Number(t);
@@ -1312,6 +1332,22 @@
         });
     }
 
+    // Extract the persisted-settings key + filename from a playback lifecycle
+    // event detail. Core sends the same { payload?, target?, settingsKey?,
+    // filename? } shape on both `loading` and the `ready` aliases (see core
+    // static/capabilities/playback.js _publicTarget: target.settingsKey is
+    // present on every playback:* emit), so both paths resolve the song key
+    // from one place — a ready that arrives without a preceding loading still
+    // gets the correct key.
+    function songRefFromDetail(detail = {}) {
+        const payload = detail && detail.payload && typeof detail.payload === 'object' ? detail.payload : (detail || {});
+        const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+        return {
+            songKey: target.settingsKey || payload.settingsKey || null,
+            filename: payload.filename || target.filename || null,
+        };
+    }
+
     function tryInitForCurrentSong() {
         const info = highway.getSongInfo && highway.getSongInfo();
         if (!info || !Array.isArray(info.stems)) return false;
@@ -1342,15 +1378,28 @@
         const hookState = window.__slopsmithStemsHooks || (window.__slopsmithStemsHooks = {});
         hookState.impl = {
             onPlaybackLoading(detail = {}) {
-                const payload = detail.payload && typeof detail.payload === 'object' ? detail.payload : detail;
-                const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+                const ref = songRefFromDetail(detail);
                 readySignature = null;
                 teardown();
-                currentSongKey = target.settingsKey || payload.settingsKey || null;
-                currentFilename = payload.filename || target.filename || currentFilename || null;
+                currentSongKey = ref.songKey;
+                currentFilename = ref.filename || currentFilename || null;
             },
-            onPlaybackReady() {
+            onPlaybackReady(detail = {}) {
+                // A `ready` alias (playback:ready / song:loaded / song:ready)
+                // can fire WITHOUT a preceding `loading` (e.g. re-entering an
+                // already-loaded song). currentSongKey would then be stale and
+                // mute/volume would persist under the wrong song key (see
+                // storageSongKey / redactedSongRef). Refresh it from the ready
+                // event's own target — but only when the ready detail actually
+                // carries a key, so a keyless ready that follows a good loading
+                // never wipes a valid key.
+                const ref = songRefFromDetail(detail);
+                if (ref.songKey) currentSongKey = ref.songKey;
+                if (ref.filename) currentFilename = ref.filename;
                 if (!tryInitForCurrentSong()) startReadyPoll();
+            },
+            onPlaybackStopped() {
+                lightStop();
             },
             teardown,
         };
@@ -1365,24 +1414,42 @@
             const impl = hookState.impl;
             if (impl && typeof impl.onPlaybackLoading === 'function') impl.onPlaybackLoading(event && event.detail || {});
         };
-        const onReady = () => {
+        const onReady = (event) => {
             const impl = hookState.impl;
-            if (impl && typeof impl.onPlaybackReady === 'function') impl.onPlaybackReady();
+            if (impl && typeof impl.onPlaybackReady === 'function') impl.onPlaybackReady(event && event.detail || {});
+        };
+        const onStopped = () => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackStopped === 'function') impl.onPlaybackStopped();
         };
         const onFinished = () => {
             const impl = hookState.impl;
             if (impl && typeof impl.teardown === 'function') impl.teardown();
         };
-        hookState.listeners = { onLoading, onReady, onFinished };
-        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        hookState.listeners = { onLoading, onReady, onStopped, onFinished };
+        // Wire the lifecycle listeners as soon as the event bus is live. If
+        // window.slopsmith.on isn't ready at eval time, retry once the
+        // capability surface signals readiness — mirroring
+        // installCapabilityParticipant()'s slopsmith:capabilities:ready retry.
+        // (Previously these subscriptions were gated once at eval and dropped
+        // silently whenever the bus wasn't up yet.)
+        const wireLifecycleListeners = () => {
+            if (!(window.slopsmith && typeof window.slopsmith.on === 'function')) {
+                window.addEventListener('slopsmith:capabilities:ready', wireLifecycleListeners, { once: true });
+                return;
+            }
             window.slopsmith.on('song:loading', onLoading);
             window.slopsmith.on('playback:loading', onLoading);
             window.slopsmith.on('playback:ready', onReady);
             window.slopsmith.on('song:loaded', onReady);
             window.slopsmith.on('song:ready', onReady);
-            window.slopsmith.on('playback:stopped', onFinished);
+            // playback:stopped = user STOP (core playback.js:880): light stop,
+            // preserve the graph so playback can resume. playback:ended =
+            // genuine song end: full teardown.
+            window.slopsmith.on('playback:stopped', onStopped);
             window.slopsmith.on('playback:ended', onFinished);
-        }
+        };
+        wireLifecycleListeners();
 
         // Clean up on leaving the player
         const _show = window.showScreen;
