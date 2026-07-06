@@ -3,6 +3,7 @@
   "name": "Stems Toggle",
   "version": "0.8.1",
   "private": false,
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "settings": {
     "html": "settings.html",
     "category": "audio"
@@ -10,5 +11,49 @@
   "script": "screen.js",
   "category": "audio",
   "description": "Separate and control individual song stems.",
-  "icon": "assets/thumb.svg"
+  "icon": "assets/thumb.svg",
+  "settings_schema": {
+    "schema_version": "1",
+    "packable_keys": ["acceptExternalMuteRequests", "manualUnmuteWins", "diagnosticsLevel"]
+  },
+  "ui": {
+    "settings": [{ "id": "stems-settings", "region": "plugin-settings", "label": "Stems Toggle" }]
+  },
+  "capabilities": {
+    "stems": {
+      "roles": ["owner", "provider"],
+      "kind": "command",
+      "commands": ["mute", "restore", "setVolume", "list", "inspect", "mute-guitar", "unmute-guitar"],
+      "emits": ["stems.ready", "stems.manual-unmute"],
+      "observes": ["claim:released"],
+      "description": "Owns stem mix automation commands and exposes sloppak stem state for requester plugins.",
+      "mode": "active",
+      "compatibility": "legacy-window-shim",
+      "ownership": "exclusive-owner",
+      "safety": "safe",
+      "version": 1
+    },
+    "playback": {
+      "roles": ["observer"],
+      "kind": "lifecycle",
+      "observes": ["loading", "ready", "stopped", "ended"],
+      "description": "Observes playback lifecycle events to rebuild or tear down the stem graph without wrapping window.playSong.",
+      "mode": "active",
+      "compatibility": "shim-allowed",
+      "ownership": "observer-only",
+      "safety": "safe",
+      "version": 1
+    },
+    "audio-mix": {
+      "roles": ["provider"],
+      "operations": ["fader.get-value", "fader.set-value"],
+      "events": ["fader-value-changed", "fader-unavailable"],
+      "description": "Registers per-stem faders with the core audio-mix coordinator while Stems owns the media graph.",
+      "mode": "active",
+      "compatibility": "none",
+      "ownership": "multi-provider",
+      "safety": "safe",
+      "version": 1
+    }
+  }
 }

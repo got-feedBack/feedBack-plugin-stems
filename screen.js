@@ -116,11 +116,15 @@
     let wired = false;                 // playSong hooks installed
     let container = null;              // UI container in #player-controls
     let currentFilename = null;
+    let currentSongKey = null;
+    const registeredMixParticipantIds = new Set();
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player).
     let pollHandle = null;
+    let readySignature = null;
     const pointerCleanupHandlers = new Set();
+    const claimSnapshots = new Map();  // claimId:stemId -> previous session-only state
 
     // ── Transport state ──
     // The buffer transport replaces the 6 HTMLMediaElement decoder clocks.
@@ -396,7 +400,7 @@
         stem.vol = clamped;
         if (stem.on && stem.gain) stem.gain.gain.value = clamped;
         updateStemButton(stem, options);
-        if (options.persist !== false && changed) saveVolume(currentFilename, stem.id, clamped);
+        if (options.persist !== false && changed) saveVolume(storageSongKey(), stem.id, clamped);
         return true;
     }
 
@@ -570,6 +574,26 @@
         transport.baseOffset = ph;
         transport.playing = false;
         dispatchAudioEvent('pause');
+    }
+
+    // A user STOP is NOT a song end. Core emits `playback:stopped` from its
+    // _stop command handler (static/capabilities/playback.js:880) on a manual
+    // STOP — a `stop` is a user-priority action, distinct from `playback:ended`
+    // which core only emits at genuine song end (transportEvent('ended') <-
+    // song:ended bridge, playback.js:1018/1074). A manual stop must therefore
+    // NOT destroy the stem graph: the session can resume. Halt our sources and
+    // freeze the playhead, but PRESERVE the decoded buffers, gain graph and
+    // mixer UI so a resume/replay re-locks instantly instead of re-fetching.
+    // Full teardown() stays reserved for playback:ended and the new-song-load /
+    // screen-leave paths.
+    function lightStop() {
+        pendingPlay = false;
+        flushPendingPlayResolvers();
+        if (!transport.playing) return;
+        const ph = transportPlayhead();
+        stopSources();
+        transport.baseOffset = ph;
+        transport.playing = false;
     }
 
     function transportSeek(t) {
@@ -823,6 +847,25 @@
         if (overlayEl) { overlayEl.remove(); overlayEl = null; }
     }
 
+    function hashString(value) {
+        const text = String(value || '');
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(36);
+    }
+
+    function storageSongKey() {
+        return currentSongKey || currentFilename || '';
+    }
+
+    function redactedSongRef(extra = {}) {
+        const songKey = currentSongKey || (currentFilename ? `legacy-${hashString(currentFilename)}` : '');
+        return songKey ? { songKey, ...extra } : { ...extra };
+    }
+
     // ── Teardown ──
     function teardown() {
         cleanupPointerHandlers();
@@ -847,11 +890,13 @@
 
         // Stop the transport and release every buffer + node.
         stopSources();
+        unregisterStemMixParticipants();
         for (const s of stemState) {
             try { s.gain && s.gain.disconnect(); } catch (_) {}
             s.buffer = null;
         }
         stemState = [];
+        claimSnapshots.clear();
         transport.playing = false;
         transport.baseOffset = 0;
         transport.baseCtxTime = 0;
@@ -900,6 +945,7 @@
 
         hideOverlay();
         pointerCleanupHandlers.clear();
+        registerStemOwnerStatus('unavailable');
         if (container) {
             container.remove();
             container = null;
@@ -1063,7 +1109,9 @@
                 s.on = !s.on;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(currentFilename, stemState);
+                saveMuted(storageSongKey(), stemState);
+                registerStemOwnerStatus('available');
+                recordStemUserOverride(s, 'User toggled Stems mute');
             };
             setStemVolume(s, s.vol, { persist: false });
             wrap.appendChild(btn);
@@ -1160,8 +1208,13 @@
 
         const karaoke = karaokeDefault();
         const defaultMuted = loadDefaultMuted();
-        const savedMuted = loadMuted(currentFilename);
-        const savedVols = loadVolumes(currentFilename);
+        const key = storageSongKey();
+        const savedMuted = loadMuted(key) || (currentSongKey ? loadMuted(currentFilename) : null);
+        const savedVols = (() => {
+            const primary = loadVolumes(key);
+            if (Object.keys(primary).length || !currentSongKey) return primary;
+            return loadVolumes(currentFilename);
+        })();
 
         // masterGain sums every stem and is driven by the Song fader.
         masterGain = ctx.createGain();
@@ -1313,6 +1366,8 @@
             // PCM now lives in the worklet; release the main-thread AudioBuffers.
             for (const s of stemState) s.buffer = null;
         }
+        registerStemMixParticipants();
+        registerStemOwnerStatus('available');
         return true;
     }
 
@@ -1877,7 +1932,7 @@
         teardown();
         const info = highway.getSongInfo && highway.getSongInfo();
         const stems = (info && info.stems) || [];
-        if (stems.length === 0) return; // archive or stem-less sloppak — do nothing
+        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0 }); return; } // archive or stem-less sloppak — do nothing
 
         ensureCtx();
         // Decide per-song whether the pitch-preserving worklet is available.
@@ -2014,88 +2069,147 @@
         injectUI();
         installSongFaderBridge();
         buffersReady = true;
+        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
 
         if (pendingPlay) { pendingPlay = false; transportPlay(); }
     }
 
-    // ── Hook playSong ──
+    function songInfoSignature(info) {
+        const stems = Array.isArray(info && info.stems) ? info.stems : [];
+        const filename = (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || '';
+        return JSON.stringify({
+            songKey: currentSongKey || '',
+            filename,
+            stems: stems.map(s => ({ id: s.id, url: s.url, default: !!s.default })),
+        });
+    }
+
+    // Extract the persisted-settings key + filename from a playback lifecycle
+    // event detail. Core sends the same { payload?, target?, settingsKey?,
+    // filename? } shape on both `loading` and the `ready` aliases (see core
+    // static/capabilities/playback.js _publicTarget: target.settingsKey is
+    // present on every playback:* emit), so both paths resolve the song key
+    // from one place — a ready that arrives without a preceding loading still
+    // gets the correct key.
+    function songRefFromDetail(detail = {}) {
+        const payload = detail && detail.payload && typeof detail.payload === 'object' ? detail.payload : (detail || {});
+        const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+        return {
+            songKey: target.settingsKey || payload.settingsKey || null,
+            filename: payload.filename || target.filename || null,
+        };
+    }
+
+    function tryInitForCurrentSong() {
+        const info = highway.getSongInfo && highway.getSongInfo();
+        if (!info || !Array.isArray(info.stems)) return false;
+        const signature = songInfoSignature(info);
+        if (signature === readySignature) return true;
+        readySignature = signature;
+        currentFilename = info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || null;
+        try { onSongReady(); } catch (e) { console.warn('[stems] init failed:', e); }
+        return true;
+    }
+
+    function startReadyPoll() {
+        if (pollHandle !== null) clearInterval(pollHandle);
+        let attempts = 0;
+        let myHandle;
+        myHandle = setInterval(() => {
+            attempts++;
+            if (tryInitForCurrentSong() || attempts >= 30) {
+                clearInterval(myHandle);
+                if (pollHandle === myHandle) pollHandle = null;
+            }
+        }, 200);
+        pollHandle = myHandle;
+    }
+
+    // ── Playback lifecycle hooks ──
     function installHooks() {
-        if (wired) return;
+        const hookState = window.__slopsmithStemsHooks || (window.__slopsmithStemsHooks = {});
+        hookState.impl = {
+            onPlaybackLoading(detail = {}) {
+                const ref = songRefFromDetail(detail);
+                readySignature = null;
+                teardown();
+                currentSongKey = ref.songKey;
+                currentFilename = ref.filename || currentFilename || null;
+            },
+            onPlaybackReady(detail = {}) {
+                // A `ready` alias (playback:ready / song:loaded / song:ready)
+                // can fire WITHOUT a preceding `loading` (e.g. re-entering an
+                // already-loaded song). currentSongKey would then be stale and
+                // mute/volume would persist under the wrong song key (see
+                // storageSongKey / redactedSongRef). Refresh it from the ready
+                // event's own target — but only when the ready detail actually
+                // carries a key, so a keyless ready that follows a good loading
+                // never wipes a valid key.
+                const ref = songRefFromDetail(detail);
+                if (ref.songKey) currentSongKey = ref.songKey;
+                if (ref.filename) currentFilename = ref.filename;
+                if (!tryInitForCurrentSong()) startReadyPoll();
+            },
+            onPlaybackStopped() {
+                lightStop();
+            },
+            teardown,
+        };
+        if (hookState.installed) return;
         wired = true;
+        hookState.installed = true;
 
         installAudioShims();
         exposeStemsGlobals();
 
-        const _play = window.playSong;
-        window.playSong = async function (f, a) {
-            teardown(); // kill any prior graph before new song loads
-            currentFilename = f;
-            await _play(f, a);
-
-            // Three independent paths to fire onSongReady, all protected
-            // by `handled` so we only build the graph once. Three paths
-            // because the wrapper chain can lose either the synchronous
-            // fast-path OR the _onReady hook depending on timing:
-            //
-            //   (1) _onReady hook — normal path.
-            //   (2) Synchronous fast-path — info.title AND info.stems are
-            //       already there when our wrapper resumes.
-            //   (3) Poll fallback — covers the race where 'ready' fires
-            //       AFTER inner wrappers' awaits resolved but BEFORE we
-            //       reach this post-await code.
-            const myFile = f;
-            let handled = false;
-            const fire = () => {
-                if (handled) return;
-                if (currentFilename !== myFile) return;
-                handled = true;
-                Promise.resolve()
-                    .then(() => onSongReady())
-                    .catch((e) => console.warn('[stems] init failed:', e));
-            };
-            const prev = highway._onReady;
-            const readyFn = () => {
-                fire();
-                if (prev) prev();
-                if (highway._onReady === readyFn) highway._onReady = null;
-            };
-            highway._onReady = readyFn;
-
-            const infoNow = highway.getSongInfo && highway.getSongInfo();
-            if (infoNow && infoNow.title && Array.isArray(infoNow.stems)) {
-                highway._onReady = null;
-                fire();
-                if (prev) prev();
-            } else {
-                let attempts = 0;
-                let myHandle;
-                myHandle = setInterval(() => {
-                    attempts++;
-                    if (handled || currentFilename !== myFile || attempts >= 30) {
-                        clearInterval(myHandle);
-                        if (pollHandle === myHandle) pollHandle = null;
-                        return;
-                    }
-                    const i = highway.getSongInfo && highway.getSongInfo();
-                    if (i && i.title && Array.isArray(i.stems)) {
-                        clearInterval(myHandle);
-                        if (pollHandle === myHandle) pollHandle = null;
-                        if (!handled) {
-                            if (highway._onReady === readyFn) highway._onReady = null;
-                            fire();
-                            if (prev) prev();
-                        }
-                    }
-                }, 200);
-                pollHandle = myHandle;
-            }
+        const onLoading = (event) => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackLoading === 'function') impl.onPlaybackLoading(event && event.detail || {});
         };
+        const onReady = (event) => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackReady === 'function') impl.onPlaybackReady(event && event.detail || {});
+        };
+        const onStopped = () => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.onPlaybackStopped === 'function') impl.onPlaybackStopped();
+        };
+        const onFinished = () => {
+            const impl = hookState.impl;
+            if (impl && typeof impl.teardown === 'function') impl.teardown();
+        };
+        hookState.listeners = { onLoading, onReady, onStopped, onFinished };
+        // Wire the lifecycle listeners as soon as the event bus is live. If
+        // window.slopsmith.on isn't ready at eval time, retry once the
+        // capability surface signals readiness — mirroring
+        // installCapabilityParticipant()'s slopsmith:capabilities:ready retry.
+        // (Previously these subscriptions were gated once at eval and dropped
+        // silently whenever the bus wasn't up yet.)
+        const wireLifecycleListeners = () => {
+            if (!(window.slopsmith && typeof window.slopsmith.on === 'function')) {
+                window.addEventListener('slopsmith:capabilities:ready', wireLifecycleListeners, { once: true });
+                return;
+            }
+            window.slopsmith.on('song:loading', onLoading);
+            window.slopsmith.on('playback:loading', onLoading);
+            window.slopsmith.on('playback:ready', onReady);
+            window.slopsmith.on('song:loaded', onReady);
+            window.slopsmith.on('song:ready', onReady);
+            // playback:stopped = user STOP (core playback.js:880): light stop,
+            // preserve the graph so playback can resume. playback:ended =
+            // genuine song end: full teardown.
+            window.slopsmith.on('playback:stopped', onStopped);
+            window.slopsmith.on('playback:ended', onFinished);
+        };
+        wireLifecycleListeners();
 
         // Clean up on leaving the player
         const _show = window.showScreen;
+        hookState.baseShowScreen = _show;
         window.showScreen = function (id) {
-            if (id !== 'player') teardown();
-            return _show(id);
+            const impl = hookState.impl;
+            if (id !== 'player' && impl && typeof impl.teardown === 'function') impl.teardown();
+            return hookState.baseShowScreen.call(this, id);
         };
     }
 
@@ -2104,6 +2218,304 @@
     function coerceBool(v) {
         if (v === 'false' || v === '0' || v === '' || v == null) return false;
         return Boolean(v);
+    }
+
+    function capabilityApi() {
+        return window.slopsmith && window.slopsmith.capabilities;
+    }
+
+    function audioSessionApi() {
+        const session = window.slopsmith && window.slopsmith.audioSession;
+        return session && session.version === 1 ? session : null;
+    }
+
+    function safeStemId(id) {
+        return String(id || 'stem').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'stem';
+    }
+
+    function stemStatesSnapshot() {
+        const snapshot = {};
+        for (const stem of stemState) {
+            snapshot[stem.id] = { id: stem.id, on: !!stem.on, muted: !stem.on, vol: stem.vol };
+        }
+        return snapshot;
+    }
+
+    function registerStemOwnerStatus(availability) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerStemOwner !== 'function') return;
+        try {
+            session.registerStemOwner({
+                ownerId: 'stems.provider',
+                participantId: 'stems.provider',
+                availability,
+                stemIds: stemState.map(stem => stem.id),
+                stemStates: stemStatesSnapshot(),
+            });
+        } catch (err) {
+            console.warn('[stems] could not register stem owner:', err);
+        }
+    }
+
+    function stemParticipantId(stem) {
+        return `stems.${safeStemId(stem && stem.id)}`;
+    }
+
+    function registerStemMixParticipant(stem) {
+        const session = audioSessionApi();
+        if (!session || typeof session.registerMixParticipant !== 'function' || !stem) return;
+        const participantId = stemParticipantId(stem);
+        try {
+            session.registerMixParticipant({
+                participantId,
+                ownerPluginId: 'stems',
+                label: `Stem: ${stem.id}`,
+                kind: 'stem',
+                sourceMode: 'native',
+                logicalFaderKey: `stems:${safeStemId(stem.id)}`,
+                fader: {
+                    id: safeStemId(stem.id),
+                    label: stem.id,
+                    min: 0,
+                    max: 1,
+                    step: 0.01,
+                    defaultValue: 1,
+                    currentValue: stem.vol,
+                },
+                operations: ['fader.get-value', 'fader.set-value'],
+                operationHandlers: {
+                    'fader.get-value': () => stem.vol,
+                    'fader.set-value': (value) => {
+                        const committed = stemsApi.setVolume(stem.id, value);
+                        if (committed === undefined) return { outcome: 'no-target', reason: `Stem ${stem.id} is no longer available` };
+                        return { committedValue: committed };
+                    },
+                },
+                availability: 'available',
+                version: 1,
+            });
+            registeredMixParticipantIds.add(participantId);
+        } catch (err) {
+            console.warn('[stems] could not register audio-mix fader:', err);
+        }
+    }
+
+    function registerStemMixParticipants() {
+        unregisterStemMixParticipants();
+        for (const stem of stemState) registerStemMixParticipant(stem);
+    }
+
+    function unregisterStemMixParticipants() {
+        const session = audioSessionApi();
+        if (session && typeof session.unregisterMixParticipant === 'function') {
+            for (const participantId of registeredMixParticipantIds) {
+                try { session.unregisterMixParticipant(participantId); } catch (_) {}
+            }
+        }
+        registeredMixParticipantIds.clear();
+    }
+
+    function isGuitarStemId(id) {
+        return /(^|[-_\s])(guitars?|rhythm|lead|dist|distortion)([-_\s]|$)/i.test(String(id || ''));
+    }
+
+    function applyStemState(stem, on, vol = stem.vol) {
+        stem.vol = Math.max(0, Math.min(1, Number.isFinite(Number(vol)) ? Number(vol) : stem.vol));
+        stem.on = !!on;
+        stem.gain.gain.value = stem.on ? stem.vol : 0;
+        if (stem.btn) stem.btn.className = stem.on ? ON_CLASS : OFF_CLASS;
+        registerStemOwnerStatus('available');
+    }
+
+    function emitStemsState(event, payload = {}) {
+        const detail = { event, ...redactedSongRef(), ...payload };
+        try { window.dispatchEvent(new CustomEvent('stems:state', { detail })); } catch (_) {}
+        const api = capabilityApi();
+        if (api && typeof api.emitEvent === 'function') {
+            api.emitEvent('stems', event === 'provider-ready' ? 'stems.ready' : event, detail);
+        }
+    }
+
+    function stemSelector(stem) {
+        return isGuitarStemId(stem && stem.id) ? 'guitar' : String(stem && stem.id || '*').toLowerCase();
+    }
+
+    function recordStemUserOverride(stem, reason) {
+        const session = audioSessionApi();
+        if (session && typeof session.recordStemManualOverride === 'function') {
+            try { session.recordStemManualOverride({ requester: 'user', stemIds: [stem.id], reason }); }
+            catch (_) {}
+        }
+        const api = capabilityApi();
+        if (!api || typeof api.recordUserOverride !== 'function') return;
+        api.recordUserOverride({
+            capability: 'stems',
+            command: 'mute',
+            source: 'user',
+            target: { id: stem.id, kind: stemSelector(stem) },
+            selector: stemSelector(stem),
+            reason,
+        });
+        if (typeof api.emitEvent === 'function') api.emitEvent('stems', 'stems.manual-unmute', redactedSongRef({ id: stem.id, on: stem.on }));
+    }
+
+    function capabilityTargets(payload = {}) {
+        if (!stemState.length) return [];
+        const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+        const id = payload.id || target.id;
+        if (id) return stemState.filter(s => s.id.toLowerCase() === String(id).toLowerCase());
+        const selector = String(payload.selector || target.selector || target.kind || '').toLowerCase();
+        if (selector === 'guitar') {
+            const guitars = stemState.filter(s => isGuitarStemId(s.id));
+            return guitars.length ? guitars : stemState.filter(s => String(s.id).toLowerCase() === 'other');
+        }
+        return stemState.slice();
+    }
+
+    function claimIdFromContext(ctx) {
+        const payload = ctx && ctx.payload && typeof ctx.payload === 'object' ? ctx.payload : {};
+        const claim = ctx && ctx.claim && typeof ctx.claim === 'object' ? ctx.claim : {};
+        return payload.claimId || claim.claimId || null;
+    }
+
+    function capMute(ctx = {}) {
+        const payload = ctx.payload || {};
+        const targets = capabilityTargets(payload);
+        if (!stemState.length) {
+            return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ mutedIds: [] }) };
+        }
+        if (!targets.length) {
+            return { outcome: 'no-target', reason: 'No matching stem target is available', payload: redactedSongRef({ mutedIds: [] }) };
+        }
+        let claimId = claimIdFromContext(ctx);
+        const session = audioSessionApi();
+        if (session && typeof session.muteStems === 'function') {
+            try {
+                const result = session.muteStems({
+                    claimId,
+                    requester: ctx.requester || payload.requester || 'stems.capability',
+                    stemIds: targets.map(stem => stem.id),
+                    restoreSnapshot: stemStatesSnapshot(),
+                });
+                claimId = claimId || (result && result.payload && result.payload.claimId) || null;
+            } catch (_) {}
+        }
+        const mutedIds = [];
+        for (const stem of targets) {
+            if (claimId) {
+                const key = `${claimId}:${stem.id}`;
+                if (!claimSnapshots.has(key)) claimSnapshots.set(key, { claimId, id: stem.id, prevOn: stem.on, prevVol: stem.vol });
+            }
+            applyStemState(stem, false, stem.vol);
+            mutedIds.push(stem.id);
+        }
+        return { outcome: 'handled', payload: redactedSongRef({ claimId, mutedIds }) };
+    }
+
+    function capRestore(ctx = {}) {
+        const claimId = claimIdFromContext(ctx);
+        if (!claimId) {
+            return { outcome: 'no-target', reason: 'Restore requires a claimId', payload: redactedSongRef({ restoredIds: [] }) };
+        }
+        const session = audioSessionApi();
+        if (session && typeof session.restoreStems === 'function' && claimId) {
+            try { session.restoreStems({ claimId, requester: ctx.requester || 'stems.capability' }); }
+            catch (_) {}
+        }
+        const restoredIds = [];
+        for (const [key, previous] of Array.from(claimSnapshots.entries())) {
+            if (previous.claimId !== claimId) continue;
+            const stem = stemState.find(s => s.id === previous.id);
+            if (stem) {
+                applyStemState(stem, previous.prevOn, previous.prevVol);
+                restoredIds.push(stem.id);
+            }
+            claimSnapshots.delete(key);
+        }
+        return { outcome: 'handled', payload: redactedSongRef({ claimId, restoredIds }) };
+    }
+
+    function clearClaimSnapshots(claimId) {
+        if (!claimId) return;
+        for (const [key, previous] of Array.from(claimSnapshots.entries())) {
+            if (previous.claimId === claimId) claimSnapshots.delete(key);
+        }
+    }
+
+    function capSetVolume(ctx = {}) {
+        const payload = ctx.payload || {};
+        if (!stemState.length) return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ stems: [] }) };
+        const committed = stemsApi.setVolume(payload.id || payload.target?.id, payload.vol ?? payload.volume);
+        if (committed === undefined) return { outcome: 'no-target', reason: 'No matching stem target is available', payload: capList().payload };
+        return { outcome: 'handled', payload: { ...capList().payload, committedValue: committed } };
+    }
+
+    function capList() {
+        return { outcome: 'handled', payload: redactedSongRef({ stems: stemsApi.getState().map(s => ({ id: s.id, vol: s.vol, on: s.on })) }) };
+    }
+
+    function capInspect() {
+        return { outcome: 'handled', payload: redactedSongRef({ activeClaims: Array.from(claimSnapshots.values()), stems: capList().payload.stems }) };
+    }
+
+    function installCapabilityParticipant() {
+        const api = capabilityApi();
+        if (!api || typeof api.registerParticipant !== 'function') {
+            window.addEventListener('slopsmith:capabilities:ready', installCapabilityParticipant, { once: true });
+            return;
+        }
+        api.registerParticipant('stems', {
+            stems: {
+                roles: ['owner', 'provider'],
+                kind: 'command',
+                commands: ['mute', 'restore', 'setVolume', 'list', 'inspect', 'mute-guitar', 'unmute-guitar'],
+                emits: ['stems.ready', 'stems.manual-unmute'],
+                observes: ['claim:released'],
+                description: 'Owns stem mix automation commands and exposes sloppak stem state for requester plugins.',
+                compatibility: 'legacy-window-shim',
+                ownership: 'exclusive-owner',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
+                handlers: {
+                    mute: capMute,
+                    restore: capRestore,
+                    setVolume: capSetVolume,
+                    list: capList,
+                    inspect: capInspect,
+                    'mute-guitar': capMute,
+                    'unmute-guitar': capRestore,
+                },
+                eventHandlers: {
+                    'claim:released': (detail) => clearClaimSnapshots(detail && detail.payload && detail.payload.claimId),
+                },
+            },
+            playback: {
+                roles: ['observer'],
+                kind: 'lifecycle',
+                observes: ['loading', 'ready', 'stopped', 'ended'],
+                description: 'Observes playback lifecycle events to rebuild or tear down the stem graph without wrapping window.playSong.',
+                compatibility: 'shim-allowed',
+                ownership: 'observer-only',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
+            },
+            'audio-mix': {
+                roles: ['provider'],
+                operations: ['fader.get-value', 'fader.set-value'],
+                events: ['fader-value-changed', 'fader-unavailable'],
+                description: 'Registers per-stem faders with the core audio-mix coordinator while Stems owns the media graph.',
+                compatibility: 'none',
+                ownership: 'multi-provider',
+                safety: 'safe',
+                version: 1,
+                runtime: true,
+            },
+        });
+        registerStemMixParticipants();
+        registerStemOwnerStatus(stemState.length ? 'available' : 'unavailable');
+        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
     }
 
     /**
@@ -2134,23 +2546,32 @@
         })),
         setVolume(id, vol) {
             const v = Number(vol);
-            if (!Number.isFinite(v)) return;
+            if (!Number.isFinite(v)) return undefined;
             const target = String(id).toLowerCase();
+            const clamped = clampVolume(v);
+            if (clamped == null) return undefined;
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
-                setStemVolume(s, v);
+                setStemVolume(s, clamped);
+                applied = true;
             }
+            if (applied) registerStemOwnerStatus('available');
+            return applied ? clamped : undefined;
         },
         setMuted(id, muted) {
             const m = coerceBool(muted);
             const target = String(id).toLowerCase();
+            let applied = false;
             for (const s of stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 s.on = !m;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(currentFilename, stemState);
+                saveMuted(storageSongKey(), stemState);
+                applied = true;
             }
+            if (applied) registerStemOwnerStatus('available');
         },
     };
     Object.defineProperty(stemsApi, 'stemState', {
@@ -2175,5 +2596,6 @@
         }
     }
 
+    installCapabilityParticipant();
     installHooks();
 })();
