@@ -70,12 +70,15 @@ def test_screen_uses_008_audio_session_contracts():
     assert "unregisterMixParticipant" in src
 
 
-def test_screen_uses_buffer_transport_shims_without_property_handlers():
+def test_screen_uses_buffer_transport_shims_via_property_handlers():
     src = (ROOT / "screen.js").read_text(encoding="utf-8")
 
+    # play/pause are installed with Object.defineProperty rather than a plain
+    # `core.play = fn` assignment: iOS WebKit exposes HTMLMediaElement.play /
+    # .pause as non-writable, so a direct assignment throws in strict mode.
     assert "Object.defineProperty(core, 'currentTime'" in src
-    assert "core.play = function" in src
-    assert "core.pause = function" in src
+    assert "Object.defineProperty(core, 'play'" in src
+    assert "Object.defineProperty(core, 'pause'" in src
     assert "core.addEventListener('ratechange'" in src
     assert "core.onplay =" not in src
     assert "core.onpause =" not in src

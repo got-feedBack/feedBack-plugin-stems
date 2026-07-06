@@ -2,6 +2,111 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [0.8.1] — Stem buttons wrap inside the v3 plugin-controls popover
+
+### Fixed
+
+- **Stem buttons no longer overflow the v3 "Plugin controls" rail popover.**
+  The mixer bar (`#stems-mixer`) is a horizontal flex row built for v2's wide
+  `#player-controls` bar. In v3 the host re-homes it into the narrow rail
+  popover (`.v3-rail-pop`, `max-width: 340px`), where the six stem buttons
+  (`min-width: 46px` each) exceeded the bubble's inner width and spilled past
+  its right edge — the popover's own `flex-wrap` can't help because the whole
+  mixer is a single child of the slot. The bar now sets `flex-wrap: wrap` on
+  itself so the buttons wrap onto additional lines inside the popover. Inert in
+  v2 (nothing to wrap in the wide bar); applied as an inline style since this
+  plugin ships no compiled stylesheet and can't rely on `flex-wrap` being in
+  core's scanned Tailwind CSS.
+
+## [0.8.0] — Bounded-memory streaming (fixes the iOS 6-stem crash)
+
+### Fixed
+
+- **6-stem sloppaks no longer crash iOS/iPadOS.** Previously every stem was
+  decoded to a full-length Float32 `AudioBuffer` up front (~500–650 MB for a
+  6-stem, 4-minute song), which jettisoned the WKWebView content process the
+  moment decode reached 6/6 — the app "crashed"/reloaded to the library.
+  Playback memory is now **bounded to a few-second window per track,
+  independent of song length and stem count** (~8 MB vs ~645 MB), at full
+  quality (no downsampling / lossy re-encode).
+
+### Changed
+
+- **Streaming playback path.** The iOS client proxy already transcodes each OGG
+  stem to RIFF/WAV (16-bit PCM) and streams it. The plugin now reads that PCM
+  incrementally off `fetch().body` and feeds the time-stretch worklet's bounded
+  ring buffer, dropping consumed PCM as playback advances. Because raw PCM is
+  sliceable at any sample, **no decoder / WebCodecs / demuxer is needed**, and
+  there is no iOS-version floor beyond `AudioWorklet` + fetch streams. The
+  worklet's WSOLA pitch-preserving speed, sample-locked mix, per-stem
+  gain/mute, unity full-mix routing, analyser hand-off, karaoke and
+  default-muted behaviour are all unchanged.
+
+  - **Feature-detected, content-driven.** Streaming engages only when a stem is
+    served as `audio/wav`; desktop/Electron (served `audio/ogg`, a container
+    that can't be sliced) keeps the existing full-decode path byte-for-byte.
+  - **Sample-accurate seek.** A seek flushes the window and refetches every
+    stem from the target so the stems stay phase-aligned. The plugin sends an
+    HTTP `Range` request and uses a `206` response for O(1) seeks when the proxy
+    supports it, falling back to re-streaming from the start (still exact, just
+    slower over LAN) when it does not.
+  - **Sample-rate pinning.** The `AudioContext` is run at the stems' native rate
+    (the OS resamples to the device) so the streamed PCM feeds the worklet
+    sample-exact with no in-JS resample.
+  - **Backpressure + under-run safety.** The worklet reports its read frontier so
+    the pump keeps ~2 s buffered ahead; if the network can't keep up the worklet
+    stalls to silence (never reads unwritten PCM, never signals a false end) and
+    resumes cleanly once fed. During such a stall the note highway (clocked off
+    the `AudioContext`) can drift briefly ahead of the audio until the buffer
+    refills — expected over a slow link, negligible on a LAN.
+
+## [0.7.1] — iOS stem playback fix
+
+### Fixed
+
+- **Stem mixer now works on iOS (iPhone/iPad).** The `#audio` takeover shims for
+  `play` / `pause` were installed with a direct `core.play = fn` assignment, which
+  iOS WebKit rejects with "Attempted to assign to readonly property" (those methods
+  are non-writable there, and the plugin runs as a strict-mode ES module). The
+  throw left the critical-shim gate `shimsUsable` false, so `onSongReady()` aborted
+  the sloppak takeover and handed playback back to the native `<audio>` element —
+  which plays only `stems[0]`. On-device this looked like "only one stem plays and
+  the mixer sliders do nothing." `play`/`pause` are now installed with
+  `Object.defineProperty` (an own property on the instance), matching the
+  currentTime/paused/duration shims and working on both WebKit and Chromium.
+  Desktop/Electron was unaffected. Discovered while running the plugin through the
+  native iOS client (`feedback-client-app`).
+
+## [0.7.0] — Pristine full mix at unity
+
+### Added
+
+- **Plays the pristine full mix when nothing is isolated.** When a sloppak ships
+  a pre-separation `original_audio` mixdown (exposed on `song_info` by core
+  #583 / feedBack#580), the plugin now loads it as one extra time-stretch track
+  and plays **it** — not the lossy demucs recombination — whenever every stem is
+  on at 100% ("unity"). The moment any stem is muted or attenuated, it crosses
+  to the separated stems; back to unity, back to the pristine mix. This wires up
+  the consumer half of #583 (previously the field was published but unused, so
+  at-unity playback always used the recombined stems) and is the audible win
+  behind the "converted stems sound tinny at rest" reports.
+
+  Worklet path only and fully opt-in: a pack without `original_audio`, or the
+  legacy (non-worklet) fallback, behaves exactly as before. Routing is a single
+  pure `computeMixGains(stems, hasFull)` (unit-tested in
+  `tests/mix-routing.test.mjs`); the full mix rides the same WSOLA graph as the
+  stems, so speed/seek/sync are unchanged.
+
+  Robustness: the full mix is only used when its length matches the stems within
+  tolerance (and its posted length is clamped to the stems), so a mismatched /
+  mis-encoded `original_audio` can't play past the song end or drop to silence
+  mid-song — it's ignored and the separated stems play. The unity↔stems
+  crossover (and any mid-playback mute/unmute) now **ramps gains over ~12 ms in
+  the worklet** instead of hard-switching, so swapping the entire mix at the
+  unity boundary doesn't click or jump in level (`tests/stretch-worklet.test.mjs`
+  gains a ramp test; the exact pass-through and instant pre-start gains are
+  unchanged).
+
 ## [0.6.0] — Pitch-preserving speed control
 
 ### Added
