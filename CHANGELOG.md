@@ -2,6 +2,23 @@
 
 All notable changes to the Stems Toggle plugin are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- **ES-module migration, step 1 — the bootstrap flip (R1 pilot).** `screen.js`
+  is now a one-line `import './src/main.js'` and the plugin declares
+  `"scriptType": "module"` (+ `"minHost": "0.3.0-alpha.1"`); the host injects it
+  as `<script type="module">` (needs core with the R0 module rails). The plugin
+  body moved verbatim to `src/main.js` (history preserved via `git mv`); the only
+  logic change is asset resolution — the worklet URL now uses
+  `new URL('../assets/stretch-worklet.js', import.meta.url)` instead of
+  `document.currentScript` (which is `null` in a module). Behaviour unchanged;
+  verified booting in-browser against core-with-R0 (module executes,
+  `window.stems` installs, worklet resolves to the plugin-root `assets/`). The
+  regex-extraction tests now read `src/main.js` (real-import conversion follows in
+  later steps). No `src/` split yet — that's the next steps.
+
 ## [0.8.1] — Stem buttons wrap inside the v3 plugin-controls popover
 
 ### Fixed
