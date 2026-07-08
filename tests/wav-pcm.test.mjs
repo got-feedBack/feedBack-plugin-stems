@@ -1,4 +1,4 @@
-// Unit tests for the pure streaming helpers in screen.js — parseWavHeader and
+// Unit tests for the pure streaming helpers in src/main.js — parseWavHeader and
 // pcm16ToFloat32 — extracted from their marker comments and eval'd (same
 // source-eval approach as mix-routing.test.mjs). These touch no DOM/closure
 // state, so they run under plain `node --test`.
@@ -14,7 +14,7 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'ut
 function extract(name) {
     const re = new RegExp('(function ' + name + '[\\s\\S]*?)\\n\\s*// --- end ' + name + ' ---');
     const m = source.match(re);
-    assert.ok(m, `${name} block (between markers) not found in screen.js`);
+    assert.ok(m, `${name} block (between markers) not found in src/main.js`);
     return eval('(' + m[1] + ')');
 }
 const parseWavHeader = extract('parseWavHeader');

@@ -19,7 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 
 test('play/pause shims use defineProperty, not the assignment that throws on iOS', () => {
-    // Strip full-line comments first: the surrounding comment in screen.js
+    // Strip full-line comments first: the surrounding comment in src/main.js
     // literally reads "`core.play = fn` assignment" to explain the fix, and a
     // naive assignment-pattern match would trip on that prose instead of code.
     const codeOnly = src.replace(/^\s*\/\/.*$/gm, '');

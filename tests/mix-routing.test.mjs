@@ -1,4 +1,4 @@
-// Unit test for the pure `computeMixGains` decision in screen.js — the routing
+// Unit test for the pure `computeMixGains` decision in src/main.js — the routing
 // that plays the pristine full mix when every stem is at unity and switches to
 // the separated stems the moment one is muted/attenuated (feedBack#580 / core
 // #583). Extracts the marker-delimited pure function from the source and evals
@@ -18,7 +18,7 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8'
 // marker that immediately follows its closing brace — no indentation assumption,
 // so it survives reformatting of the body.
 const m = src.match(/(function computeMixGains[\s\S]*?)\n\s*\/\/ --- end computeMixGains ---/);
-assert.ok(m, 'computeMixGains block (between markers) not found in screen.js');
+assert.ok(m, 'computeMixGains block (between markers) not found in src/main.js');
 const computeMixGains = eval('(' + m[1] + ')');
 
 const S = (on, vol) => ({ on, vol });
