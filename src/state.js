@@ -51,3 +51,17 @@ export const S = {
     latencyOffsetSec: 0,            // that latency expressed in song time
     fullTrackIndex: -1,
 };
+
+// #audio transport-shim state (reassigned scalars → container, same reason as S).
+// Captured core descriptors + native play/pause, and the install/usable guards.
+// Read across the transport layer + onSongReady, so it lives here, not module-
+// private to the (future) shims module.
+export const SH = {
+    shimsInstalled: false,       // re-entry guard (prevents recapture/double-define)
+    shimsUsable: false,          // critical shims (currentTime + play + pause) all succeeded
+    coreCurrentTimeDesc: null,
+    corePausedDesc: null,
+    coreDurationDesc: null,
+    coreNativePlay: null,
+    coreNativePause: null,
+};
