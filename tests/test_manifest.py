@@ -71,7 +71,7 @@ def test_screen_uses_008_audio_session_contracts():
 
 
 def test_screen_uses_buffer_transport_shims_via_property_handlers():
-    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "transport.js").read_text(encoding="utf-8")
 
     # play/pause are installed with Object.defineProperty rather than a plain
     # `core.play = fn` assignment: iOS WebKit exposes HTMLMediaElement.play /
