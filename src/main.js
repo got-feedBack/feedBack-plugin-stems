@@ -4,6 +4,7 @@ import { clampVolume, coerceBool, hashString, isGuitarStemId } from './util.js';
 import {
     ensureCtx, resumeCtx, ensureWorklet, ensureCtxAtRate, updateLatencyOffset,
 } from './audio-ctx.js';
+import { makeStemGainHandle } from './mix.js';
 import {
     karaokeDefault, setKaraokeDefault,
     loadDefaultMuted, saveDefaultMuted,
@@ -71,26 +72,8 @@ import {
     // stem is on at 100% ("unity"); the moment any stem is muted/attenuated we
     // cross to the separated stems. Worklet path only; -1 = no full-mix track.
 
-    // --- computeMixGains (pure; node-testable, see tests/mix-routing.test.mjs) ---
-    // Given each stem's {on, vol} and whether a pristine full-mix track is
-    // loaded, return the worklet gains. At unity (a full mix is present AND every
-    // stem is on at ~100%) the full mix plays alone and the stems are silent;
-    // otherwise the stems mix at their own gains and the full mix is silent.
-    // computeMixGains → src/mix-gains.js (imported above).
-
-    // Post the authoritative gain for every track (stems + the full mix) to the
-    // worklet, honouring the unity → full-mix routing. Called on any stem change
-    // (via the gain handle below) when a full-mix track exists.
-    function applyMixRouting() {
-        if (!(S.useWorklet && S.workletNode && S.workletPostReady)) return;
-        const { stemGains, fullGain } = computeMixGains(S.stemState, S.fullTrackIndex >= 0);
-        for (let i = 0; i < stemGains.length; i++) {
-            try { S.workletNode.port.postMessage({ type: 'gain', index: i, value: stemGains[i] }); } catch (_) {}
-        }
-        if (S.fullTrackIndex >= 0 && fullGain != null) {
-            try { S.workletNode.port.postMessage({ type: 'gain', index: S.fullTrackIndex, value: fullGain }); } catch (_) {}
-        }
-    }
+    // Mix routing (applyMixRouting + the per-stem gain handle) → src/mix.js;
+    // computeMixGains (pure) → src/mix-gains.js. Both imported above.
 
     function cleanupPointerHandlers() {
         for (const cleanup of pointerCleanupHandlers) {
@@ -143,44 +126,6 @@ import {
             if (Number.isFinite(stored)) return Math.max(0, Math.min(1, stored / 100));
         } catch (_) { /* localStorage blocked */ }
         return 0.8;
-    }
-
-    // A stand-in for a per-stem GainNode that forwards volume changes to the
-    // worklet instead. Exposes the same `.gain.value` / `.connect` / `.disconnect`
-    // surface so every existing `s.gain.gain.value = …` write and the public
-    // window.stems API keep working unchanged in worklet mode.
-    function makeStemGainHandle(index) {
-        let value = 0;
-        const gain = {};
-        Object.defineProperty(gain, 'value', {
-            configurable: true,
-            enumerable: true,
-            get() { return value; },
-            set(nv) {
-                const num = Number(nv);
-                value = Number.isFinite(num) ? num : 0;
-                // With a pristine full-mix track loaded, every stem change must
-                // re-evaluate unity routing (which also flips the full track), so
-                // route through applyMixRouting; it posts the authoritative gain
-                // for this and every other track. Without a full mix, keep the
-                // original direct per-stem post (byte-identical behaviour).
-                if (S.fullTrackIndex >= 0) {
-                    // applyMixRouting recomputes every gain from S.stemState. The
-                    // internal toggle/volume paths set S.stemState first, but an
-                    // EXTERNAL direct `gain.value = v` write doesn't — so reflect
-                    // a positive write into the authoritative volume here, else
-                    // routing would ignore it. (A 0 write is left to setMuted,
-                    // which can distinguish "muted" from "0% volume".)
-                    if (value > 0 && S.stemState[index]) S.stemState[index].vol = value;
-                    applyMixRouting();
-                } else if (S.workletPostReady && S.workletNode) {
-                    try { S.workletNode.port.postMessage({ type: 'gain', index, value }); } catch (_) {}
-                }
-            },
-        });
-        // connect/disconnect are no-ops: external consumers (e.g. stem_mixer)
-        // may call them on the "gain node", but mixing now lives in the worklet.
-        return { gain, connect() {}, disconnect() {} };
     }
 
     function onWorkletMessage(e) {
