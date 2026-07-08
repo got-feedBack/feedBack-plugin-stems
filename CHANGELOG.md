@@ -6,6 +6,18 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 11 — extract the buffer transport + `#audio` shims
+  to `src/transport.js`.** The top of the playback engine moves out of `main.js`:
+  the playhead clock (`transportPlayhead`/`Raw`), source start/stop
+  (`startSources`/`workletStartSources`/`stopSources`), `transportPlay`/`Pause`/
+  `Seek`/`setTransportRate`/`lightStop`/`handleNaturalEnd`/`dispatchAudioEvent`,
+  the shared `onWorkletMessage` handler, and `installAudioShims` + the `nativeCore*`
+  helpers. It's a clean upper layer — imports state + audio-ctx + streaming and is
+  imported back by `main.js` — so the bodies moved **verbatim** (no seam needed;
+  streaming already gets `transportPlay`/`onWorkletMessage` via the step-10
+  injection, so `transport → streaming` is cycle-free). `main.js` 1840 → 1412 lines.
+  The `ios-play-pause-shim` + manifest shim tests now read `src/transport.js`.
+  Move-only, no behaviour change; on-device playback/seek/rate smoke passed.
 - **ES-module migration, step 10 — extract the streaming path to
   `src/streaming.js`.** The bounded-memory iOS WAV streaming layer (the
   reader/WAV helpers, the worklet-feed pump + its seek/reposition, `setupStreaming`,
