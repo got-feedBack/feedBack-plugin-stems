@@ -6,6 +6,16 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 3 — extract the persistence layer to `src/prefs.js`
+  (R1 pilot).** The localStorage helpers (`loadDefaultMuted`/`saveDefaultMuted`,
+  `loadMuted`/`saveMuted`, `loadVolumes`/`saveVolume`, `karaokeDefault` + a new
+  `setKaraokeDefault` wrapping the one inline write) and their storage keys leave
+  `src/main.js` for `src/prefs.js`; the karaoke-toggle wiring now calls the
+  helpers instead of `localStorage` directly. New `tests/prefs.test.mjs` covers
+  it with a **real import** against an in-memory storage stub (round-trips +
+  corrupt-value degradation), validating prefs.js is import-pure. Move-only, zero
+  behaviour change; 29/29 node + 10/10 pytest, 4-module graph boots against
+  core-with-R0.
 - **ES-module migration, step 2 — first pure-module extractions (R1 pilot).**
   The pure helpers move out of `src/main.js` into their own modules:
   `computeMixGains` → `src/mix-gains.js`, and `parseWavHeader` /
