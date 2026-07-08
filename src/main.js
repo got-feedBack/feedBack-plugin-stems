@@ -2,6 +2,9 @@ import { computeMixGains } from './mix-gains.js';
 import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
 import { clampVolume, coerceBool, hashString, isGuitarStemId } from './util.js';
 import {
+    ensureCtx, resumeCtx, ensureWorklet, ensureCtxAtRate, updateLatencyOffset,
+} from './audio-ctx.js';
+import {
     karaokeDefault, setKaraokeDefault,
     loadDefaultMuted, saveDefaultMuted,
     loadMuted, saveMuted, loadVolumes, saveVolume,
@@ -43,11 +46,6 @@ import {
     // is given the SAME `when` so all 6 sources begin on the identical sample;
     // the small lead guarantees `when` is still in the future for all of them.
     const START_LEAD = 0.03;
-
-    // Base URL of this plugin's served assets, e.g. "/api/plugins/stems/".
-    // Worklet from our own assets/ (no CDN). From src/main.js, assets/ is one
-    // level up; import.meta.url is the module URL (currentScript is null here).
-    const WORKLET_URL = new URL('../assets/stretch-worklet.js', import.meta.url).href;
 
     // ── Plugin state ──
     // The Song-fader bridge (window.slopsmith.stems.setMasterVolume) is a
@@ -145,60 +143,6 @@ import {
             if (Number.isFinite(stored)) return Math.max(0, Math.min(1, stored / 100));
         } catch (_) { /* localStorage blocked */ }
         return 0.8;
-    }
-
-    function ensureCtx() {
-        if (!S.audioCtx) {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            S.audioCtx = new AC();
-        }
-        return S.audioCtx;
-    }
-
-    // Resume the AudioContext if suspended, swallowing BOTH a synchronous
-    // throw and the async rejection AudioContext.resume() produces when the
-    // browser blocks resume outside a user gesture.
-    function resumeCtx() {
-        if (!S.audioCtx || S.audioCtx.state !== 'suspended') return;
-        try {
-            const p = S.audioCtx.resume();
-            if (p && p.catch) p.catch(() => {});
-        } catch (_) { /* resume unsupported */ }
-    }
-
-    // Register the time-stretch worklet module once. Resolves to true when the
-    // worklet is usable, false to signal the caller to fall back to legacy
-    // (pitch-coupling) playback. Memoised; a failed load is retried next song.
-    function ensureWorklet() {
-        if (S.workletReady) return Promise.resolve(true);
-        if (S.workletModulePromise) return S.workletModulePromise;
-        if (!S.audioCtx || !S.audioCtx.audioWorklet || !WORKLET_URL) return Promise.resolve(false);
-        S.workletModulePromise = S.audioCtx.audioWorklet.addModule(WORKLET_URL)
-            .then(() => { S.workletReady = true; return true; })
-            .catch((e) => {
-                // Log once, not every song — a missing core asset route (404)
-                // would otherwise spam the console on each load.
-                if (!S.workletWarned) {
-                    console.warn('[stems] worklet module load failed; using legacy mode:', e);
-                    S.workletWarned = true;
-                }
-                S.workletModulePromise = null; // allow a retry on the next song
-                return false;
-            });
-        return S.workletModulePromise;
-    }
-
-    // WSOLA buffers audio internally, so what is HEARD lags the read frontier
-    // by a fixed number of output samples (worklet 'ready' reports it). In song
-    // time that lag scales with the rate. At rate 1.0 the worklet is an exact
-    // pass-through (no stretch, no latency), so the offset is zero.
-    function updateLatencyOffset() {
-        if (S.useWorklet && S.audioCtx && S.workletLatencyOutSamples > 0
-                && Math.abs(transport.rate - 1) > 1e-6) {
-            S.latencyOffsetSec = (S.workletLatencyOutSamples / S.audioCtx.sampleRate) * transport.rate;
-        } else {
-            S.latencyOffsetSec = 0;
-        }
     }
 
     // A stand-in for a per-stem GainNode that forwards volume changes to the
@@ -1489,25 +1433,6 @@ import {
         if (token !== streamSeekToken || gen !== S.loadGeneration) return;
         pumpStop = false;
         runPump(false);
-    }
-
-    // Recreate the AudioContext at `rate` when it differs, so streamed PCM feeds
-    // the worklet at its native rate (the OS resamples to the device) — no in-JS
-    // resample, and the worklet stays sample-exact. Re-registers the worklet
-    // module on the new context. Returns true if the context is usable at `rate`.
-    async function ensureCtxAtRate(rate) {
-        ensureCtx();
-        if (S.audioCtx && Math.abs(S.audioCtx.sampleRate - rate) < 1) return true;
-        try { if (S.audioCtx) { const old = S.audioCtx; S.audioCtx = null; try { old.close(); } catch (_) {} } } catch (_) {}
-        S.workletReady = false;
-        S.workletModulePromise = null;
-        const AC = window.AudioContext || window.webkitAudioContext;
-        try { S.audioCtx = new AC({ sampleRate: rate }); }
-        catch (_) { try { S.audioCtx = new AC(); } catch (__) { return false; } }
-        const ok = await ensureWorklet();
-        // If the engine ignored the sampleRate option, we can't feed native-rate
-        // PCM without resampling — refuse streaming and let the caller bail.
-        return ok && !!S.audioCtx && Math.abs(S.audioCtx.sampleRate - rate) < 1;
     }
 
     // Build the streaming graph + pump from the fetched WAV streams. `probeResp`
