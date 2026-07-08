@@ -1,12 +1,12 @@
-// Unit tests for src/streaming.js's pure-ish exports. Real ES-module import.
-// The pump/seek internals (appendRound/runPump/repositionStream) drive the Web
-// Audio worklet + fetch and aren't exported, so their seek-token race guard is
-// covered by the on-device seek-stress smoke, not here.
+// Unit tests for src/streaming.js. The pure-ish exports (streamingSupported,
+// isWavResponse, streamOffsetBuffered) plus the seek-token guard on appendRound.
+// The rest of the pump/seek internals drive fetch + the worklet, so their end-to-
+// end behaviour is covered by the on-device seek-stress smoke.
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ST } from '../src/state.js';
-import { streamingSupported, isWavResponse, streamOffsetBuffered } from '../src/streaming.js';
+import { S, ST } from '../src/state.js';
+import { streamingSupported, isWavResponse, streamOffsetBuffered, appendRound } from '../src/streaming.js';
 
 test('isWavResponse: true only when content-type contains "wav"', () => {
     const mk = (ct) => ({ headers: { get: () => ct } });
@@ -62,4 +62,40 @@ test('streamOffsetBuffered: always true when not streaming or rate unknown', () 
     assert.equal(streamOffsetBuffered(0.0), true);
     ST.streaming = true; ST.streamSampleRate = 0;
     assert.equal(streamOffsetBuffered(999), true);
+});
+
+// ── appendRound seek-token guard (the step-9.1 race fix) ──────────────────────
+// A silent track (totalFrames=0 → realWanted<=0) exercises the guards without a
+// reader/fetch: appendRound must post only when its captured token still matches
+// ST.streamSeekToken, else drop the block (a seek superseded it).
+function primeAppendRound() {
+    const posted = [];
+    S.workletNode = { port: { postMessage: (m) => posted.push(m) } };
+    ST.streamTracks = [{ nch: 2, totalFrames: 0 }];   // silent path, no reader needed
+    ST.streamTotalSamples = 10000;
+    ST.jsWriteFrontier = 0;
+    ST.streamSampleRate = 48000;
+    ST.lastWorkletPos = 10000;   // aheadTarget high → frames > 0
+    ST.pumpStop = false;
+    ST.streamSeekToken = 5;
+    return posted;
+}
+
+test('appendRound posts the block when its token still matches', async () => {
+    const posted = primeAppendRound();
+    const ok = await appendRound(5);
+    assert.equal(ok, true);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].type, 'append');
+    assert.equal(posted[0].base, 0);
+    assert.equal(posted[0].frames, 8192);       // min(CHUNK, remaining, ahead)
+    assert.equal(ST.jsWriteFrontier, 8192);     // frontier advanced
+});
+
+test('appendRound drops the block (no post) once a seek supersedes its token', async () => {
+    const posted = primeAppendRound();
+    const ok = await appendRound(4);            // stale token (current is 5)
+    assert.equal(ok, false);
+    assert.deepEqual(posted, []);               // nothing posted to the worklet
+    assert.equal(ST.jsWriteFrontier, 0);        // frontier NOT advanced
 });

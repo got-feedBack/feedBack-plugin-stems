@@ -119,7 +119,8 @@ async function dequeueTrackFrames(t, frames) {
 
 // Append one aligned block for every track at the current write frontier,
 // reading PCM as needed and zero-padding tracks past their own end.
-async function appendRound(token = ST.streamSeekToken) {
+// (Exported for the seek-token guard test; not part of the plugin's public API.)
+export async function appendRound(token = ST.streamSeekToken) {
     const remaining = ST.streamTotalSamples - ST.jsWriteFrontier;
     if (remaining <= 0) return false;
     const aheadTarget = Math.min(ST.streamTotalSamples,
@@ -203,6 +204,14 @@ async function runPump(isInitial) {
     }
 }
 
+// INVARIANT (seek safety): this sets t.done = true SYNCHRONOUSLY for every track.
+// repositionStream calls it before its first await, so any in-flight dequeue's
+// parked t.reader.read() resolves (cancelled) with t.done already true and
+// ensureBytes exits — it can't loop onto a reopened reader, because openTrackStreams
+// only reinstalls t.reader/t.done=false AFTER a network fetch (a macrotask later).
+// Keep the synchronous t.done=true if this is ever refactored, or reopened readers
+// on the same track objects could be consumed by a stale append (see appendRound's
+// per-track token guard, which is the second line of defence).
 function cancelStreamReaders() {
     for (const t of ST.streamTracks) {
         try { t.reader && t.reader.cancel(); } catch (_) {}
