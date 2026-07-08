@@ -1238,7 +1238,7 @@ import {
 
     // Append one aligned block for every track at the current write frontier,
     // reading PCM as needed and zero-padding tracks past their own end.
-    async function appendRound() {
+    async function appendRound(token = ST.streamSeekToken) {
         const remaining = ST.streamTotalSamples - ST.jsWriteFrontier;
         if (remaining <= 0) return false;
         const aheadTarget = Math.min(ST.streamTotalSamples,
@@ -1249,6 +1249,12 @@ import {
         const blocks = [];
         const transfer = [];
         for (const t of ST.streamTracks) {
+            // Bail before touching each track once a seek supersedes us: dequeue
+            // reads t.reader fresh, and repositionStream reopens readers on these
+            // same track objects — consuming a later track here would steal PCM
+            // from the new pump. The in-flight track (if any) resolves off its own
+            // now-cancelled reader, so it can't reach the fresh ones.
+            if (token !== ST.streamSeekToken) return false;
             const realWanted = Math.max(0, Math.min(frames, t.totalFrames - ST.jsWriteFrontier));
             let chans;
             if (realWanted <= 0) {
@@ -1268,7 +1274,11 @@ import {
             for (const c of chans) transfer.push(c.buffer);
             blocks.push({ channels: chans });
         }
-        if (ST.pumpStop || !S.workletNode) return false;
+        // A seek (repositionStream) bumps streamSeekToken and resets jsWriteFrontier.
+        // If it landed while we were awaiting dequeueTrackFrames above, these blocks
+        // are misaligned to the old frontier — drop them. Checking pumpStop alone is
+        // not enough: repositionStream clears it again before this continuation runs.
+        if (ST.pumpStop || token !== ST.streamSeekToken || !S.workletNode) return false;
         try {
             S.workletNode.port.postMessage({ type: 'append', base: ST.jsWriteFrontier, frames, tracks: blocks }, transfer);
         } catch (_) { return false; }
@@ -1287,22 +1297,25 @@ import {
     // The pump: keep the worklet window ~STREAM_AHEAD_SEC ahead of its read
     // frontier. On the initial run, prefill then start (honouring pending play).
     async function runPump(isInitial) {
+        // Capture the seek token for this pump run: a seek supersedes us by bumping
+        // it, so every loop guard + append re-checks it after awaits (see appendRound).
+        const token = ST.streamSeekToken;
         try {
             const prefillTo = Math.min(ST.streamTotalSamples,
                 ST.jsWriteFrontier + Math.ceil(STREAM_PREFILL_SEC * ST.streamSampleRate));
-            while (!ST.pumpStop && ST.jsWriteFrontier < prefillTo) {
-                if (!(await appendRound())) break;
+            while (!ST.pumpStop && token === ST.streamSeekToken && ST.jsWriteFrontier < prefillTo) {
+                if (!(await appendRound(token))) break;
             }
-            if (ST.pumpStop) return;
+            if (ST.pumpStop || token !== ST.streamSeekToken) return;
             if (isInitial) {
                 S.buffersReady = true;
                 if (S.pendingPlay) { S.pendingPlay = false; transportPlay(); }
             }
-            while (!ST.pumpStop && ST.jsWriteFrontier < ST.streamTotalSamples) {
+            while (!ST.pumpStop && token === ST.streamSeekToken && ST.jsWriteFrontier < ST.streamTotalSamples) {
                 const target = Math.min(ST.streamTotalSamples,
                     ST.lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * ST.streamSampleRate));
                 if (ST.jsWriteFrontier >= target) { await waitPos(); continue; }
-                if (!(await appendRound())) break;
+                if (!(await appendRound(token))) break;
             }
         } catch (e) {
             if (!ST.pumpStop && (!e || e.name !== 'AbortError')) console.warn('[stems] stream pump error:', e);
@@ -1351,6 +1364,9 @@ import {
         const gen = S.loadGeneration;
         ST.pumpStop = true;
         cancelStreamReaders();
+        // Unblock an old pump parked in waitPos() so it re-checks its (now stale)
+        // token and exits promptly, instead of hanging until the 100ms timeout.
+        if (ST.posWaiter) { const r = ST.posWaiter; ST.posWaiter = null; try { r(); } catch (_) {} }
         const Tsamp = Math.max(0, Math.round(targetSec * ST.streamSampleRate));
         if (S.workletNode) {
             try { S.workletNode.port.postMessage({ type: 'seek', offset: Tsamp / ST.streamSampleRate }); } catch (_) {}
@@ -1367,7 +1383,11 @@ import {
         }
         if (token !== ST.streamSeekToken || gen !== S.loadGeneration) return;
         ST.pumpStop = false;
-        runPump(false);
+        // If a seek supersedes the initial prefill, runPump(true) returns before
+        // flipping S.buffersReady / honouring pendingPlay. Carry the initial role
+        // forward until readiness is actually established, else the stream would
+        // stay silent (play() only sets pendingPlay) until a reload.
+        runPump(!S.buffersReady);
     }
 
     // Build the streaming graph + pump from the fetched WAV streams. `probeResp`
