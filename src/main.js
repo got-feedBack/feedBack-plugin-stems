@@ -1151,7 +1151,7 @@ import {
         let maxDur = 0;
         S.stemState = ok.map((r, i) => {
             // Worklet mode: a gain HANDLE that forwards to the worklet; legacy
-            // mode: a real per-stem GainNode S.wired into S.masterGain.
+            // mode: a real per-stem GainNode wired into S.masterGain.
             let gain;
             if (S.useWorklet) {
                 gain = makeStemGainHandle(i);
@@ -1830,7 +1830,7 @@ import {
 
         // Probe stem[0] to choose the path by Content-Type: the iOS proxy serves
         // `audio/wav` (raw PCM — streamable, bounded memory); desktop serves
-        // `audio/ogg` (a S.container — keep the full-decode path). Streaming also
+        // `audio/ogg` (a container — keep the full-decode path). Streaming also
         // needs the worklet + fetch ReadableStream. The Range header lets a
         // 206-capable proxy serve efficiently; the current proxy/desktop returns
         // a full 200, which streams fine.
@@ -2384,7 +2384,7 @@ import {
      *                        in [0, 1]; out-of-range clamped, NaN ignored.
      *   setMuted(id, muted)  `muted=true` mutes, `false` unmutes. Common
      *                        non-boolean inputs are coerced to false.
-     *   S.stemState            Live array of internal stem-state objects.
+     *   stemState              Live array of internal stem-state objects.
      */
     const stemsApi = {
         getState: () => S.stemState.map(s => ({
