@@ -8,9 +8,10 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 - **ES-module migration, step 4a — extract the state containers to `src/state.js`
   (R1 pilot).** The data-structure state that is never reassigned — the
-  `transport` object (playhead/rate/duration clock) and the `registeredMix
-  ParticipantIds` / `pointerCleanupHandlers` / `claimSnapshots` Set/Map
-  containers — moves to `src/state.js` as `export const`. Because these are only
+  `transport` object (playhead/rate/duration clock) and the
+  `registeredMixParticipantIds` / `pointerCleanupHandlers` / `claimSnapshots`
+  Set/Map containers — moves to `src/state.js` as `export const`. Because these
+  are only
   *mutated* (never reassigned), `main.js` imports them with **zero reference
   changes** at the ~90 call sites. The reassigned scalars (`ctx`, `stemState`,
   `masterGain`, `workletNode`, …) stay in `main.js` for the follow-up accessor
