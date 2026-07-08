@@ -26,6 +26,12 @@ test('streamingSupported: true only when all three platform APIs exist', () => {
         globalThis.fetch = function () {};
         globalThis.AudioWorkletNode = function () {};
         assert.equal(streamingSupported(), true);
+        delete globalThis.ReadableStream;                    // no stream → unsupported
+        assert.equal(streamingSupported(), false);
+        globalThis.ReadableStream = function () {};
+        delete globalThis.fetch;                             // no fetch → unsupported
+        assert.equal(streamingSupported(), false);
+        globalThis.fetch = function () {};
         delete globalThis.AudioWorkletNode;                  // no worklet → unsupported
         assert.equal(streamingSupported(), false);
     } finally {
