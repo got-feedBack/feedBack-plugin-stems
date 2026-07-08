@@ -17,7 +17,8 @@ All notable changes to the Stems Toggle plugin are documented here.
   streaming already gets `transportPlay`/`onWorkletMessage` via the step-10
   injection, so `transport → streaming` is cycle-free). `main.js` 1840 → 1412 lines.
   The `ios-play-pause-shim` + manifest shim tests now read `src/transport.js`.
-  Move-only, no behaviour change; on-device playback/seek/rate smoke passed.
+  Move-only, no behaviour change; on-device playback/seek/rate smoke recommended
+  before release.
 - **ES-module migration, step 10 — extract the streaming path to
   `src/streaming.js`.** The bounded-memory iOS WAV streaming layer (the
   reader/WAV helpers, the worklet-feed pump + its seek/reposition, `setupStreaming`,
