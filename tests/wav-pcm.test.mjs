@@ -1,24 +1,9 @@
-// Unit tests for the pure streaming helpers in src/main.js — parseWavHeader and
-// pcm16ToFloat32 — extracted from their marker comments and eval'd (same
-// source-eval approach as mix-routing.test.mjs). These touch no DOM/closure
-// state, so they run under plain `node --test`.
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+// Unit tests for the pure streaming helpers (src/wav-pcm.js) — parseWavHeader
+// and pcm16ToFloat32. Real ES-module import — the marker/eval source extraction
+// is retired now that the functions live in their own module.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-
-function extract(name) {
-    const re = new RegExp('(function ' + name + '[\\s\\S]*?)\\n\\s*// --- end ' + name + ' ---');
-    const m = source.match(re);
-    assert.ok(m, `${name} block (between markers) not found in src/main.js`);
-    return eval('(' + m[1] + ')');
-}
-const parseWavHeader = extract('parseWavHeader');
-const pcm16ToFloat32 = extract('pcm16ToFloat32');
+import { parseWavHeader, pcm16ToFloat32 } from '../src/wav-pcm.js';
 
 // Build a canonical 44-byte RIFF/WAV header (+ optional trailing bytes).
 function wavHeader(nch, sampleRate, dataSize, extraTrailing = 0) {
