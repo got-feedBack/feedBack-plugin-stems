@@ -6,7 +6,7 @@ import {
     loadMuted, saveMuted, loadVolumes, saveVolume,
 } from './prefs.js';
 import {
-    transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
+    S, transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
 } from './state.js';
 
 (function () {
@@ -49,33 +49,14 @@ import {
     const WORKLET_URL = new URL('../assets/stretch-worklet.js', import.meta.url).href;
 
     // ── Plugin state ──
-    let ctx = null;                    // shared AudioContext (reused across songs)
-    let masterGain = null;             // sums every stem; driven by the Song fader
-    let analyserNode = null;           // tap off masterGain for audio-reactive plugins
     // The Song-fader bridge (window.slopsmith.stems.setMasterVolume) is a
     // shared global. Track whether WE installed it and snapshot whatever was
     // there first, so teardown() restores the prior value instead of blindly
     // deleting another plugin's hook.
-    let songFaderBridgeInstalled = false;
-    let priorSetMasterVolume;
-    let stemState = [];                // [{ id, url, default, buffer, source, gain, on, vol, btn, volFill }]
-    let wired = false;                 // playSong hooks installed
-    let container = null;              // UI container in #player-controls
-    let currentFilename = null;
-    let currentSongKey = null;
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player).
-    let pollHandle = null;
-    let readySignature = null;
     // transport + the Set/Map state containers → src/state.js (imported above).
-    let sloppakActive = false;         // true while a sloppak owns #audio transport
-    let buffersReady = false;          // true once all stems are decoded + graphed
-    let pendingPlay = false;           // a play() arrived before buffers were ready
-    let pendingPlayResolvers = [];     // resolve fns for #audio.play() promises awaiting a deferred start
-    let loadGeneration = 0;            // bumped on every song change / teardown
-    let abortController = null;        // aborts in-flight stem fetches
-    let overlayEl = null;              // "Decoding stems…" loading overlay
 
     // ── Pitch-preserving time-stretch worklet ──
     // When available, a single AudioWorkletNode ('stem-mixer') OWNS every
@@ -83,22 +64,13 @@ import {
     // the single mix so the speed slider changes tempo without pitch (matching
     // archive's HTMLMediaElement.preservesPitch). When unavailable, we fall back
     // to today's AudioBufferSourceNode-per-stem path (speed couples pitch).
-    let workletNode = null;            // the 'stem-mixer' source node (worklet mode)
-    let workletReady = false;          // ctx.audioWorklet.addModule() resolved
-    let workletModulePromise = null;   // in-flight addModule() (memoised)
-    let useWorklet = false;            // this song is using the worklet path
-    let workletWarned = false;         // logged the legacy-mode fallback once
-    let workletPostReady = false;      // safe to post 'gain' (after 'load' sent)
-    let workletLatencyOutSamples = 0;  // WSOLA output latency (output samples);
                                        // 0 = unknown → no compensation until the
                                        // worklet's 'ready' message reports it.
-    let latencyOffsetSec = 0;          // that latency expressed in song time
     // Pristine full-mix track (feedBack#580 / core #583). When a sloppak ships
     // a pre-separation `original_audio` mixdown, we load it as one extra worklet
     // track and play IT instead of the lossy demucs recombination whenever every
     // stem is on at 100% ("unity"); the moment any stem is muted/attenuated we
     // cross to the separated stems. Worklet path only; -1 = no full-mix track.
-    let fullTrackIndex = -1;
 
     // --- computeMixGains (pure; node-testable, see tests/mix-routing.test.mjs) ---
     // Given each stem's {on, vol} and whether a pristine full-mix track is
@@ -111,13 +83,13 @@ import {
     // worklet, honouring the unity → full-mix routing. Called on any stem change
     // (via the gain handle below) when a full-mix track exists.
     function applyMixRouting() {
-        if (!(useWorklet && workletNode && workletPostReady)) return;
-        const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+        if (!(S.useWorklet && S.workletNode && S.workletPostReady)) return;
+        const { stemGains, fullGain } = computeMixGains(S.stemState, S.fullTrackIndex >= 0);
         for (let i = 0; i < stemGains.length; i++) {
-            try { workletNode.port.postMessage({ type: 'gain', index: i, value: stemGains[i] }); } catch (_) {}
+            try { S.workletNode.port.postMessage({ type: 'gain', index: i, value: stemGains[i] }); } catch (_) {}
         }
-        if (fullTrackIndex >= 0 && fullGain != null) {
-            try { workletNode.port.postMessage({ type: 'gain', index: fullTrackIndex, value: fullGain }); } catch (_) {}
+        if (S.fullTrackIndex >= 0 && fullGain != null) {
+            try { S.workletNode.port.postMessage({ type: 'gain', index: S.fullTrackIndex, value: fullGain }); } catch (_) {}
         }
     }
 
@@ -181,20 +153,20 @@ import {
     }
 
     function ensureCtx() {
-        if (!ctx) {
+        if (!S.audioCtx) {
             const AC = window.AudioContext || window.webkitAudioContext;
-            ctx = new AC();
+            S.audioCtx = new AC();
         }
-        return ctx;
+        return S.audioCtx;
     }
 
     // Resume the AudioContext if suspended, swallowing BOTH a synchronous
     // throw and the async rejection AudioContext.resume() produces when the
     // browser blocks resume outside a user gesture.
     function resumeCtx() {
-        if (!ctx || ctx.state !== 'suspended') return;
+        if (!S.audioCtx || S.audioCtx.state !== 'suspended') return;
         try {
-            const p = ctx.resume();
+            const p = S.audioCtx.resume();
             if (p && p.catch) p.catch(() => {});
         } catch (_) { /* resume unsupported */ }
     }
@@ -203,22 +175,22 @@ import {
     // worklet is usable, false to signal the caller to fall back to legacy
     // (pitch-coupling) playback. Memoised; a failed load is retried next song.
     function ensureWorklet() {
-        if (workletReady) return Promise.resolve(true);
-        if (workletModulePromise) return workletModulePromise;
-        if (!ctx || !ctx.audioWorklet || !WORKLET_URL) return Promise.resolve(false);
-        workletModulePromise = ctx.audioWorklet.addModule(WORKLET_URL)
-            .then(() => { workletReady = true; return true; })
+        if (S.workletReady) return Promise.resolve(true);
+        if (S.workletModulePromise) return S.workletModulePromise;
+        if (!S.audioCtx || !S.audioCtx.audioWorklet || !WORKLET_URL) return Promise.resolve(false);
+        S.workletModulePromise = S.audioCtx.audioWorklet.addModule(WORKLET_URL)
+            .then(() => { S.workletReady = true; return true; })
             .catch((e) => {
                 // Log once, not every song — a missing core asset route (404)
                 // would otherwise spam the console on each load.
-                if (!workletWarned) {
+                if (!S.workletWarned) {
                     console.warn('[stems] worklet module load failed; using legacy mode:', e);
-                    workletWarned = true;
+                    S.workletWarned = true;
                 }
-                workletModulePromise = null; // allow a retry on the next song
+                S.workletModulePromise = null; // allow a retry on the next song
                 return false;
             });
-        return workletModulePromise;
+        return S.workletModulePromise;
     }
 
     // WSOLA buffers audio internally, so what is HEARD lags the read frontier
@@ -226,11 +198,11 @@ import {
     // time that lag scales with the rate. At rate 1.0 the worklet is an exact
     // pass-through (no stretch, no latency), so the offset is zero.
     function updateLatencyOffset() {
-        if (useWorklet && ctx && workletLatencyOutSamples > 0
+        if (S.useWorklet && S.audioCtx && S.workletLatencyOutSamples > 0
                 && Math.abs(transport.rate - 1) > 1e-6) {
-            latencyOffsetSec = (workletLatencyOutSamples / ctx.sampleRate) * transport.rate;
+            S.latencyOffsetSec = (S.workletLatencyOutSamples / S.audioCtx.sampleRate) * transport.rate;
         } else {
-            latencyOffsetSec = 0;
+            S.latencyOffsetSec = 0;
         }
     }
 
@@ -253,17 +225,17 @@ import {
                 // route through applyMixRouting; it posts the authoritative gain
                 // for this and every other track. Without a full mix, keep the
                 // original direct per-stem post (byte-identical behaviour).
-                if (fullTrackIndex >= 0) {
-                    // applyMixRouting recomputes every gain from stemState. The
-                    // internal toggle/volume paths set stemState first, but an
+                if (S.fullTrackIndex >= 0) {
+                    // applyMixRouting recomputes every gain from S.stemState. The
+                    // internal toggle/volume paths set S.stemState first, but an
                     // EXTERNAL direct `gain.value = v` write doesn't — so reflect
                     // a positive write into the authoritative volume here, else
                     // routing would ignore it. (A 0 write is left to setMuted,
                     // which can distinguish "muted" from "0% volume".)
-                    if (value > 0 && stemState[index]) stemState[index].vol = value;
+                    if (value > 0 && S.stemState[index]) S.stemState[index].vol = value;
                     applyMixRouting();
-                } else if (workletPostReady && workletNode) {
-                    try { workletNode.port.postMessage({ type: 'gain', index, value }); } catch (_) {}
+                } else if (S.workletPostReady && S.workletNode) {
+                    try { S.workletNode.port.postMessage({ type: 'gain', index, value }); } catch (_) {}
                 }
             },
         });
@@ -276,7 +248,7 @@ import {
         const msg = e && e.data;
         if (!msg) return;
         if (msg.type === 'ready') {
-            if (msg.latencyOutSamples > 0) workletLatencyOutSamples = msg.latencyOutSamples;
+            if (msg.latencyOutSamples > 0) S.workletLatencyOutSamples = msg.latencyOutSamples;
             updateLatencyOffset();
         } else if (msg.type === 'ended') {
             handleNaturalEnd();
@@ -293,9 +265,9 @@ import {
                 // highway during a stall (each urgent 'pos' resets it to the held
                 // pos), so it stays in sync. Steady playback is a near-no-op (both
                 // clocks track the audio clock at the same rate).
-                if (streaming && transport.playing && ctx && streamSampleRate > 0) {
+                if (streaming && transport.playing && S.audioCtx && streamSampleRate > 0) {
                     transport.baseOffset = msg.pos / streamSampleRate;
-                    transport.baseCtxTime = ctx.currentTime;
+                    transport.baseCtxTime = S.audioCtx.currentTime;
                 }
             }
             if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
@@ -339,14 +311,14 @@ import {
     // ── Buffer transport ──
 
     // Derive the playhead from the AudioContext clock — never from an
-    // <audio> element, so it cannot drift from the stems it shares `ctx`.
+    // <audio> element, so it cannot drift from the stems it shares `S.audioCtx`.
     // "Raw" = the input read frontier, before WSOLA latency compensation.
     function transportPlayheadRaw() {
         const dur = transport.duration;
-        if (!transport.playing || !ctx) {
+        if (!transport.playing || !S.audioCtx) {
             return Math.max(0, Math.min(transport.baseOffset, dur > 0 ? dur : transport.baseOffset));
         }
-        const elapsed = Math.max(0, ctx.currentTime - transport.baseCtxTime);
+        const elapsed = Math.max(0, S.audioCtx.currentTime - transport.baseCtxTime);
         const t = transport.baseOffset + elapsed * transport.rate;
         return Math.max(0, dur > 0 ? Math.min(t, dur) : t);
     }
@@ -357,24 +329,24 @@ import {
     // actually heard. Paused/stopped and legacy mode return the raw value.
     function transportPlayhead() {
         const raw = transportPlayheadRaw();
-        if (!useWorklet || !transport.playing || latencyOffsetSec <= 0) return raw;
+        if (!S.useWorklet || !transport.playing || S.latencyOffsetSec <= 0) return raw;
         const dur = transport.duration;
-        const t = raw - latencyOffsetSec;
+        const t = raw - S.latencyOffsetSec;
         return Math.max(0, dur > 0 ? Math.min(t, dur) : t);
     }
 
     // Stop + release every active source node. Detaching `onended` first
     // means the natural-end handler never fires for an intentional stop.
     function stopSources() {
-        if (useWorklet) {
+        if (S.useWorklet) {
             // The worklet node lives for the whole song; just tell it to stop
             // advancing and go silent. It is disconnected/disposed in teardown().
-            if (workletNode) {
-                try { workletNode.port.postMessage({ type: 'stop' }); } catch (_) {}
+            if (S.workletNode) {
+                try { S.workletNode.port.postMessage({ type: 'stop' }); } catch (_) {}
             }
             return;
         }
-        for (const s of stemState) {
+        for (const s of S.stemState) {
             const src = s.source;
             if (!src) continue;
             try { src.onended = null; } catch (_) {}
@@ -388,14 +360,14 @@ import {
     // state and begins advancing its single read pointer, so all stems stay
     // sample-locked by construction (one mix, one stretch).
     function workletStartSources(offset) {
-        if (!workletNode) return;
+        if (!S.workletNode) return;
         const dur = transport.duration;
         const startAt = Math.max(0, dur > 0 ? Math.min(offset, dur) : offset);
         try {
-            workletNode.port.postMessage({ type: 'start', offset: startAt, rate: transport.rate });
+            S.workletNode.port.postMessage({ type: 'start', offset: startAt, rate: transport.rate });
         } catch (_) {}
         transport.baseOffset = startAt;
-        transport.baseCtxTime = ctx.currentTime;
+        transport.baseCtxTime = S.audioCtx.currentTime;
         // Begin from the start position unless we're already at the very end;
         // a too-late offset just makes the worklet post 'ended' on the next
         // quantum, which flips playing back to false.
@@ -406,20 +378,20 @@ import {
     // (Re)create one AudioBufferSourceNode per stem, all started at one
     // shared `when` so they are sample-locked, playing from `offset`.
     function startSources(offset) {
-        if (!ctx) return;
-        if (useWorklet) { workletStartSources(offset); return; }
+        if (!S.audioCtx) return;
+        if (S.useWorklet) { workletStartSources(offset); return; }
         stopSources();
-        const when = ctx.currentTime + START_LEAD;
+        const when = S.audioCtx.currentTime + START_LEAD;
         let longest = null;
         let longestDur = -1;
-        for (const s of stemState) {
+        for (const s of S.stemState) {
             if (!s.buffer) continue;
             const startOffset = Math.max(0, Math.min(offset, s.buffer.duration));
             // Seeking to/past a stem's end: the buffer is exhausted there and
             // `start(when, offset >= buffer.duration)` can throw on stricter
             // runtimes. Skip starting; nothing to play for this stem.
             if (startOffset >= s.buffer.duration) continue;
-            const src = ctx.createBufferSource();
+            const src = S.audioCtx.createBufferSource();
             src.buffer = s.buffer;
             try { src.playbackRate.value = transport.rate; } catch (_) {}
             src.connect(s.gain);
@@ -451,9 +423,9 @@ import {
     // the deferred play finally started or was cancelled — so awaiting
     // callers never hang.
     function flushPendingPlayResolvers() {
-        if (pendingPlayResolvers.length === 0) return;
-        const resolvers = pendingPlayResolvers;
-        pendingPlayResolvers = [];
+        if (S.pendingPlayResolvers.length === 0) return;
+        const resolvers = S.pendingPlayResolvers;
+        S.pendingPlayResolvers = [];
         for (const resolve of resolvers) {
             try { resolve(); } catch (_) {}
         }
@@ -472,7 +444,7 @@ import {
 
     function transportPlay() {
         resumeCtx();
-        if (!buffersReady) { pendingPlay = true; return; }
+        if (!S.buffersReady) { S.pendingPlay = true; return; }
         if (transport.playing) { flushPendingPlayResolvers(); return; }
         let offset = transportPlayhead();
         if (transport.duration > 0 && offset >= transport.duration - 0.001) offset = 0;
@@ -491,7 +463,7 @@ import {
     }
 
     function transportPause() {
-        pendingPlay = false;
+        S.pendingPlay = false;
         flushPendingPlayResolvers();
         if (!transport.playing) return;
         const ph = transportPlayhead();
@@ -512,7 +484,7 @@ import {
     // Full teardown() stays reserved for playback:ended and the new-song-load /
     // screen-leave paths.
     function lightStop() {
-        pendingPlay = false;
+        S.pendingPlay = false;
         flushPendingPlayResolvers();
         if (!transport.playing) return;
         const ph = transportPlayhead();
@@ -531,17 +503,17 @@ import {
             // the target (repositionStream posts the worklet 'seek'). Re-baseline
             // the clock; works whether or not we're currently playing.
             transport.baseOffset = target;
-            transport.baseCtxTime = ctx ? ctx.currentTime : 0;
+            transport.baseCtxTime = S.audioCtx ? S.audioCtx.currentTime : 0;
             repositionStream(target);
-        } else if (useWorklet) {
+        } else if (S.useWorklet) {
             // Tell the worklet to move its read pointer and flush WSOLA state
             // so no stale stretched audio bleeds across the seek. Re-baseline
             // the clock; works whether or not we're currently playing.
-            if (workletNode) {
-                try { workletNode.port.postMessage({ type: 'seek', offset: target }); } catch (_) {}
+            if (S.workletNode) {
+                try { S.workletNode.port.postMessage({ type: 'seek', offset: target }); } catch (_) {}
             }
             transport.baseOffset = target;
-            transport.baseCtxTime = ctx ? ctx.currentTime : 0;
+            transport.baseCtxTime = S.audioCtx ? S.audioCtx.currentTime : 0;
         } else if (transport.playing) {
             // Stop + recreate all sources at the new offset so they relock.
             startSources(target);
@@ -560,22 +532,22 @@ import {
         const rate = Number(r);
         if (!Number.isFinite(rate) || rate <= 0) return;
         if (transport.rate === rate) return;
-        if (transport.playing && ctx) {
+        if (transport.playing && S.audioCtx) {
             // Re-baseline so the playhead stays continuous across the change.
             // Use the RAW frontier (not latency-compensated): the new latency
             // offset is re-applied forward, so capturing the compensated value
             // here would double-count it and jump the reported time.
             transport.baseOffset = transportPlayheadRaw();
-            transport.baseCtxTime = ctx.currentTime;
+            transport.baseCtxTime = S.audioCtx.currentTime;
         }
         transport.rate = rate;
-        if (useWorklet) {
-            if (workletNode) {
-                try { workletNode.port.postMessage({ type: 'rate', rate }); } catch (_) {}
+        if (S.useWorklet) {
+            if (S.workletNode) {
+                try { S.workletNode.port.postMessage({ type: 'rate', rate }); } catch (_) {}
             }
             updateLatencyOffset();
         } else {
-            for (const s of stemState) {
+            for (const s of S.stemState) {
                 if (s.source) {
                     try { s.source.playbackRate.value = rate; } catch (_) {}
                 }
@@ -584,7 +556,7 @@ import {
     }
 
     function handleNaturalEnd() {
-        if (!sloppakActive) return;
+        if (!S.sloppakActive) return;
         transport.baseOffset = transport.duration;
         transport.playing = false;
         stopSources();
@@ -666,11 +638,11 @@ import {
                 Object.defineProperty(core, 'currentTime', {
                     configurable: true,
                     get() {
-                        if (sloppakActive) return transportPlayhead();
+                        if (S.sloppakActive) return transportPlayhead();
                         return coreCurrentTimeDesc.get.call(this);
                     },
                     set(v) {
-                        if (sloppakActive) { transportSeek(v); return; }
+                        if (S.sloppakActive) { transportSeek(v); return; }
                         if (coreCurrentTimeDesc.set) coreCurrentTimeDesc.set.call(this, v);
                     },
                 });
@@ -682,7 +654,7 @@ import {
                 Object.defineProperty(core, 'paused', {
                     configurable: true,
                     get() {
-                        if (sloppakActive) return !transport.playing;
+                        if (S.sloppakActive) return !transport.playing;
                         return corePausedDesc.get.call(this);
                     },
                 });
@@ -693,7 +665,7 @@ import {
                 Object.defineProperty(core, 'duration', {
                     configurable: true,
                     get() {
-                        if (sloppakActive && transport.duration > 0) return transport.duration;
+                        if (S.sloppakActive && transport.duration > 0) return transport.duration;
                         return coreDurationDesc.get.call(this);
                     },
                 });
@@ -714,14 +686,14 @@ import {
                 configurable: true,
                 writable: true,
                 value: function () {
-                    if (sloppakActive) {
+                    if (S.sloppakActive) {
                         transportPlay();
                         // Resolve immediately if playback actually started; otherwise
                         // return a promise that settles when the deferred play starts
                         // (or is cancelled), matching HTMLMediaElement.play()'s
                         // "resolves once playback begins" contract.
-                        if (transport.playing || !pendingPlay) return Promise.resolve();
-                        return new Promise((resolve) => { pendingPlayResolvers.push(resolve); });
+                        if (transport.playing || !S.pendingPlay) return Promise.resolve();
+                        return new Promise((resolve) => { S.pendingPlayResolvers.push(resolve); });
                     }
                     return coreNativePlay();
                 },
@@ -733,7 +705,7 @@ import {
                 configurable: true,
                 writable: true,
                 value: function () {
-                    if (sloppakActive) { transportPause(); return; }
+                    if (S.sloppakActive) { transportPause(); return; }
                     return coreNativePause();
                 },
             });
@@ -742,7 +714,7 @@ import {
         // The slopsmith speed slider writes #audio.playbackRate; mirror it
         // onto every live buffer source.
         core.addEventListener('ratechange', () => {
-            if (sloppakActive) setTransportRate(core.playbackRate);
+            if (S.sloppakActive) setTransportRate(core.playbackRate);
         });
 
         shimsUsable = ctOk && playOk && pauseOk;
@@ -751,25 +723,25 @@ import {
     // ── Loading overlay ──
     function showOverlay(done, total) {
         hideOverlay();
-        overlayEl = document.createElement('div');
-        overlayEl.id = 'stems-loading-overlay';
-        overlayEl.style.cssText = 'position:fixed;left:50%;bottom:84px;'
+        S.overlayEl = document.createElement('div');
+        S.overlayEl.id = 'stems-loading-overlay';
+        S.overlayEl.style.cssText = 'position:fixed;left:50%;bottom:84px;'
             + 'transform:translateX(-50%);z-index:9999;'
             + 'background:rgba(17,17,27,0.95);border:1px solid #2a2a3e;'
             + 'border-radius:8px;padding:9px 16px;color:#e5e7eb;'
             + 'font-size:13px;font-weight:500;pointer-events:none;'
             + 'box-shadow:0 4px 16px rgba(0,0,0,0.5);';
         setOverlayText(done, total);
-        document.body.appendChild(overlayEl);
+        document.body.appendChild(S.overlayEl);
     }
     function updateOverlay(done, total) {
-        if (overlayEl) setOverlayText(done, total);
+        if (S.overlayEl) setOverlayText(done, total);
     }
     function setOverlayText(done, total) {
-        overlayEl.textContent = `Decoding stems… ${done}/${total}`;
+        S.overlayEl.textContent = `Decoding stems… ${done}/${total}`;
     }
     function hideOverlay() {
-        if (overlayEl) { overlayEl.remove(); overlayEl = null; }
+        if (S.overlayEl) { S.overlayEl.remove(); S.overlayEl = null; }
     }
 
     function hashString(value) {
@@ -783,44 +755,44 @@ import {
     }
 
     function storageSongKey() {
-        return currentSongKey || currentFilename || '';
+        return S.currentSongKey || S.currentFilename || '';
     }
 
     function redactedSongRef(extra = {}) {
-        const songKey = currentSongKey || (currentFilename ? `legacy-${hashString(currentFilename)}` : '');
+        const songKey = S.currentSongKey || (S.currentFilename ? `legacy-${hashString(S.currentFilename)}` : '');
         return songKey ? { songKey, ...extra } : { ...extra };
     }
 
     // ── Teardown ──
     function teardown() {
         cleanupPointerHandlers();
-        if (pollHandle !== null) {
-            clearInterval(pollHandle);
-            pollHandle = null;
+        if (S.pollHandle !== null) {
+            clearInterval(S.pollHandle);
+            S.pollHandle = null;
         }
         // Abort any in-flight stem load and invalidate its generation so a
         // fetch/decode that resolves later for the previous song is
         // discarded instead of building a stale graph.
-        if (abortController) {
-            try { abortController.abort(); } catch (_) {}
-            abortController = null;
+        if (S.abortController) {
+            try { S.abortController.abort(); } catch (_) {}
+            S.abortController = null;
         }
         // Stop the streaming pump + cancel its readers (aborting the fetches
         // above already rejects in-flight reads; this also clears state).
         resetStreamState();
-        loadGeneration++;
-        buffersReady = false;
-        pendingPlay = false;
+        S.loadGeneration++;
+        S.buffersReady = false;
+        S.pendingPlay = false;
         flushPendingPlayResolvers();
 
         // Stop the transport and release every buffer + node.
         stopSources();
         unregisterStemMixParticipants();
-        for (const s of stemState) {
+        for (const s of S.stemState) {
             try { s.gain && s.gain.disconnect(); } catch (_) {}
             s.buffer = null;
         }
-        stemState = [];
+        S.stemState = [];
         claimSnapshots.clear();
         transport.playing = false;
         transport.baseOffset = 0;
@@ -829,58 +801,58 @@ import {
 
         // Release the time-stretch worklet (frees the transferred PCM in the
         // audio thread). stopSources() above already posted 'stop'.
-        if (workletNode) {
-            try { workletNode.port.postMessage({ type: 'dispose' }); } catch (_) {}
-            try { workletNode.port.onmessage = null; } catch (_) {}
-            try { workletNode.disconnect(); } catch (_) {}
-            workletNode = null;
+        if (S.workletNode) {
+            try { S.workletNode.port.postMessage({ type: 'dispose' }); } catch (_) {}
+            try { S.workletNode.port.onmessage = null; } catch (_) {}
+            try { S.workletNode.disconnect(); } catch (_) {}
+            S.workletNode = null;
         }
-        workletPostReady = false;
-        fullTrackIndex = -1;
-        latencyOffsetSec = 0;
+        S.workletPostReady = false;
+        S.fullTrackIndex = -1;
+        S.latencyOffsetSec = 0;
         // Back to "unknown" — the next song's worklet re-reports it via 'ready'.
-        workletLatencyOutSamples = 0;
+        S.workletLatencyOutSamples = 0;
 
-        if (analyserNode) {
-            try { analyserNode.disconnect(); } catch (_) {}
-            analyserNode = null;
+        if (S.analyserNode) {
+            try { S.analyserNode.disconnect(); } catch (_) {}
+            S.analyserNode = null;
         }
-        if (masterGain) {
-            try { masterGain.disconnect(); } catch (_) {}
-            masterGain = null;
+        if (S.masterGain) {
+            try { S.masterGain.disconnect(); } catch (_) {}
+            S.masterGain = null;
         }
 
         // Restore the Song-fader bridge to whatever owned it before this
         // plugin installed its hook — but only if the hook is STILL ours.
-        if (songFaderBridgeInstalled) {
+        if (S.songFaderBridgeInstalled) {
             if (window.slopsmith && window.slopsmith.stems
                     && window.slopsmith.stems.setMasterVolume === songFaderHook) {
                 // Restore ANY prior value (not just a function) so a non-function
                 // sentinel another plugin set (e.g. null) is preserved rather
                 // than deleted; only delete when there was genuinely no prior.
-                if (priorSetMasterVolume !== undefined) {
-                    window.slopsmith.stems.setMasterVolume = priorSetMasterVolume;
+                if (S.priorSetMasterVolume !== undefined) {
+                    window.slopsmith.stems.setMasterVolume = S.priorSetMasterVolume;
                 } else {
                     delete window.slopsmith.stems.setMasterVolume;
                 }
             }
-            songFaderBridgeInstalled = false;
-            priorSetMasterVolume = undefined;
+            S.songFaderBridgeInstalled = false;
+            S.priorSetMasterVolume = undefined;
         }
 
         hideOverlay();
         pointerCleanupHandlers.clear();
         registerStemOwnerStatus('unavailable');
-        if (container) {
-            container.remove();
-            container = null;
+        if (S.container) {
+            S.container.remove();
+            S.container = null;
         }
 
         // Hand transport control back to the core <audio> element. After
         // this point the #audio shims delegate to core's native/JUCE
         // behaviour, so archive and JUCE playback are untouched.
-        sloppakActive = false;
-        // Leave ctx alive — it is reused across songs to avoid browser
+        S.sloppakActive = false;
+        // Leave S.audioCtx alive — it is reused across songs to avoid browser
         // "too many AudioContexts" warnings.
     }
 
@@ -894,23 +866,23 @@ import {
         const prev = document.getElementById('stems-mixer');
         if (prev) prev.remove();
 
-        container = document.createElement('div');
-        container.id = 'stems-mixer';
-        container.className = 'flex items-center gap-1.5';
+        S.container = document.createElement('div');
+        S.container.id = 'stems-mixer';
+        S.container.className = 'flex items-center gap-1.5';
         // flex-wrap so the stem buttons wrap onto a new line instead of
         // overflowing when the host re-homes this bar into the narrow v3
         // "Plugin controls" rail popover (.v3-rail-pop, max-width 340px).
         // Inert in v2's wide #player-controls bar (nothing to wrap there);
         // inline (not a Tailwind class) since this plugin ships no compiled
         // stylesheet and can't rely on flex-wrap being in core's scanned CSS.
-        container.style.cssText = 'flex-wrap:wrap;padding:0 6px;border-left:1px solid #2a2a3e;margin-left:4px;';
+        S.container.style.cssText = 'flex-wrap:wrap;padding:0 6px;border-left:1px solid #2a2a3e;margin-left:4px;';
 
         const label = document.createElement('span');
         label.textContent = 'Stems';
         label.style.cssText = 'font-size:10px;color:#6b7280;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-right:4px;';
-        container.appendChild(label);
+        S.container.appendChild(label);
 
-        for (const s of stemState) {
+        for (const s of S.stemState) {
             const wrap = document.createElement('div');
             wrap.style.cssText = 'position:relative;display:inline-block;';
 
@@ -981,7 +953,7 @@ import {
                 pointerStartY = event.clientY;
                 const rect = btn.getBoundingClientRect();
                 pointerBounds = { left: rect.left, width: rect.width };
-                pointerFilename = currentFilename;
+                pointerFilename = S.currentFilename;
                 pointerStartVolume = s.vol;
                 suppressNextClick = false;
                 try {
@@ -1034,7 +1006,7 @@ import {
                 s.on = !s.on;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(storageSongKey(), stemState);
+                saveMuted(storageSongKey(), S.stemState);
                 registerStemOwnerStatus('available');
                 recordStemUserOverride(s, 'User toggled Stems mute');
             };
@@ -1050,13 +1022,13 @@ import {
             const sentinel = document.createElement('span');
             sentinel.style.display = 'none';
             wrap.appendChild(sentinel);
-            container.appendChild(wrap);
+            S.container.appendChild(wrap);
         }
 
         // Insert before the separator span, same pattern invert uses
         const separator = c.querySelector('span.text-gray-700');
-        if (separator && separator.parentNode === c) c.insertBefore(container, separator);
-        else c.appendChild(container);
+        if (separator && separator.parentNode === c) c.insertBefore(S.container, separator);
+        else c.appendChild(S.container);
     }
 
     // ── Decode pipeline ──
@@ -1065,7 +1037,7 @@ import {
     // decodeAudioData is supported by Electron/Chromium and every modern
     // browser slopsmith targets.
     function decodeAudioData(arrayBuffer) {
-        return ctx.decodeAudioData(arrayBuffer);
+        return S.audioCtx.decodeAudioData(arrayBuffer);
     }
 
     // Fetch + decode every stem concurrently. Returns one entry per stem
@@ -1080,25 +1052,25 @@ import {
                 const resp = await fetch(s.url, { signal });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const arrayBuf = await resp.arrayBuffer();
-                if (gen !== loadGeneration) return null;
+                if (gen !== S.loadGeneration) return null;
                 const buffer = await decodeAudioData(arrayBuf);
-                if (gen !== loadGeneration) return null;
+                if (gen !== S.loadGeneration) return null;
                 return { id: s.id, url: s.url, default: !!s.default, buffer };
             } catch (err) {
-                if (gen !== loadGeneration) return null;
+                if (gen !== S.loadGeneration) return null;
                 console.error('[stems] failed to load stem "' + s.id + '":', err);
                 return { id: s.id, url: s.url, default: !!s.default, buffer: null };
             } finally {
                 // Count every finished attempt — success OR failure — so the
                 // overlay progress can't stall at e.g. 5/6 on a failed stem.
-                if (gen === loadGeneration) {
+                if (gen === S.loadGeneration) {
                     completed += 1;
                     updateOverlay(completed, stems.length);
                 }
             }
         }));
 
-        if (gen !== loadGeneration) return null;
+        if (gen !== S.loadGeneration) return null;
         return out;
     }
 
@@ -1110,11 +1082,11 @@ import {
             const resp = await fetch(url, { signal });
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             const arrayBuf = await resp.arrayBuffer();
-            if (gen !== loadGeneration) return null;
+            if (gen !== S.loadGeneration) return null;
             const buffer = await decodeAudioData(arrayBuf);
-            return gen === loadGeneration ? buffer : null;
+            return gen === S.loadGeneration ? buffer : null;
         } catch (err) {
-            if (gen !== loadGeneration) return null;
+            if (gen !== S.loadGeneration) return null;
             console.warn('[stems] full-mix load failed; using separated stems only:', err);
             return null;
         }
@@ -1134,58 +1106,58 @@ import {
         const karaoke = karaokeDefault();
         const defaultMuted = loadDefaultMuted();
         const key = storageSongKey();
-        const savedMuted = loadMuted(key) || (currentSongKey ? loadMuted(currentFilename) : null);
+        const savedMuted = loadMuted(key) || (S.currentSongKey ? loadMuted(S.currentFilename) : null);
         const savedVols = (() => {
             const primary = loadVolumes(key);
-            if (Object.keys(primary).length || !currentSongKey) return primary;
-            return loadVolumes(currentFilename);
+            if (Object.keys(primary).length || !S.currentSongKey) return primary;
+            return loadVolumes(S.currentFilename);
         })();
 
-        // masterGain sums every stem and is driven by the Song fader.
-        masterGain = ctx.createGain();
-        masterGain.gain.value = persistedSongGain();
-        masterGain.connect(ctx.destination);
-        // The analyser is a side-chain TAP: masterGain fans out to it, but it
+        // S.masterGain sums every stem and is driven by the Song fader.
+        S.masterGain = S.audioCtx.createGain();
+        S.masterGain.gain.value = persistedSongGain();
+        S.masterGain.connect(S.audioCtx.destination);
+        // The analyser is a side-chain TAP: S.masterGain fans out to it, but it
         // has no onward connection, so an external plugin calling
         // getAnalyser().disconnect() cannot sever the audible path.
-        analyserNode = ctx.createAnalyser();
-        analyserNode.fftSize = 256;
-        masterGain.connect(analyserNode);
+        S.analyserNode = S.audioCtx.createAnalyser();
+        S.analyserNode.fftSize = 256;
+        S.masterGain.connect(S.analyserNode);
 
         // In worklet mode the single 'stem-mixer' node replaces every per-stem
-        // AudioBufferSourceNode + GainNode and feeds masterGain directly. It has
+        // AudioBufferSourceNode + GainNode and feeds S.masterGain directly. It has
         // zero inputs (it is the source) and stereo output.
-        if (useWorklet) {
+        if (S.useWorklet) {
             try {
-                workletNode = new AudioWorkletNode(ctx, 'stem-mixer', {
+                S.workletNode = new AudioWorkletNode(S.audioCtx, 'stem-mixer', {
                     numberOfInputs: 0,
                     numberOfOutputs: 1,
                     outputChannelCount: [2],
                 });
-                workletNode.port.onmessage = onWorkletMessage;
-                workletNode.connect(masterGain);
+                S.workletNode.port.onmessage = onWorkletMessage;
+                S.workletNode.connect(S.masterGain);
             } catch (e) {
                 // Construction can throw if the module isn't really registered;
                 // drop to legacy mode for this song rather than play nothing.
                 console.warn('[stems] stem-mixer node failed; using legacy mode:', e);
-                useWorklet = false;
-                workletNode = null;
+                S.useWorklet = false;
+                S.workletNode = null;
             }
         }
         // Suppress per-stem gain posts until the 'load' message (with the full
         // initial gain snapshot) has been sent.
-        workletPostReady = false;
+        S.workletPostReady = false;
 
         let maxDur = 0;
-        stemState = ok.map((r, i) => {
+        S.stemState = ok.map((r, i) => {
             // Worklet mode: a gain HANDLE that forwards to the worklet; legacy
-            // mode: a real per-stem GainNode wired into masterGain.
+            // mode: a real per-stem GainNode wired into S.masterGain.
             let gain;
-            if (useWorklet) {
+            if (S.useWorklet) {
                 gain = makeStemGainHandle(i);
             } else {
-                gain = ctx.createGain();
-                gain.connect(masterGain);
+                gain = S.audioCtx.createGain();
+                gain.connect(S.masterGain);
             }
 
             // Saved per-song state wins; then default-muted preset; then
@@ -1221,14 +1193,14 @@ import {
         const coreRate = core ? Number(core.playbackRate) : 1;
         transport.rate = (Number.isFinite(coreRate) && coreRate > 0) ? coreRate : 1;
 
-        if (useWorklet && workletNode) {
+        if (S.useWorklet && S.workletNode) {
             // Hand the decoded PCM to the worklet. Copy each channel (slice)
             // then transfer the copy's buffer so the audio thread owns it with
             // no lingering main-thread duplicate. decodeAudioData already
-            // resampled every stem to ctx.sampleRate, so channels line up.
+            // resampled every stem to S.audioCtx.sampleRate, so channels line up.
             const stemsMsg = [];
             const transfer = [];
-            for (const s of stemState) {
+            for (const s of S.stemState) {
                 const buf = s.buffer;
                 const channels = [];
                 for (let ch = 0; ch < buf.numberOfChannels; ch++) {
@@ -1251,10 +1223,10 @@ import {
             // the song past where the stems (and the highway) end. The worklet
             // mixes any channel layout (a mono track feeds both outputs), so no
             // channel-count check is needed.
-            fullTrackIndex = -1;
+            S.fullTrackIndex = -1;
             const stemMaxLen = stemsMsg.reduce((m, s) => Math.max(m, s.length), 0);
             if (fullBuffer) {
-                const tol = Math.max(2048, Math.round(0.05 * (ctx ? ctx.sampleRate : 48000)));
+                const tol = Math.max(2048, Math.round(0.05 * (S.audioCtx ? S.audioCtx.sampleRate : 48000)));
                 if (Math.abs(fullBuffer.length - stemMaxLen) > tol) {
                     console.warn('[stems] original_audio length off by '
                         + (fullBuffer.length - stemMaxLen) + ' samples (> ' + tol
@@ -1269,16 +1241,16 @@ import {
                     // Clamp to the stem length so this track can't push the
                     // worklet's `total` past the transport/highway end.
                     stemsMsg.push({ channels, length: Math.min(fullBuffer.length, stemMaxLen) });
-                    fullTrackIndex = stemState.length;   // tracks come after the stems
+                    S.fullTrackIndex = S.stemState.length;   // tracks come after the stems
                 }
             }
             // Initial gains honour unity routing: at unity the full mix plays
             // alone (stems silent); otherwise stems mix and the full track is 0.
-            const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+            const { stemGains, fullGain } = computeMixGains(S.stemState, S.fullTrackIndex >= 0);
             const gains = stemGains.slice();
-            if (fullTrackIndex >= 0) gains.push(fullGain);
+            if (S.fullTrackIndex >= 0) gains.push(fullGain);
             try {
-                workletNode.port.postMessage({ type: 'load', stems: stemsMsg, gains }, transfer);
+                S.workletNode.port.postMessage({ type: 'load', stems: stemsMsg, gains }, transfer);
             } catch (e) {
                 console.warn('[stems] worklet load failed; using legacy mode:', e);
                 // Too late to rebuild GainNodes cleanly here; safest is to bail
@@ -1286,10 +1258,10 @@ import {
                 teardown();
                 return false;
             }
-            workletPostReady = true;
+            S.workletPostReady = true;
             updateLatencyOffset();
             // PCM now lives in the worklet; release the main-thread AudioBuffers.
-            for (const s of stemState) s.buffer = null;
+            for (const s of S.stemState) s.buffer = null;
         }
         registerStemMixParticipants();
         registerStemOwnerStatus('available');
@@ -1432,9 +1404,9 @@ import {
             for (const c of chans) transfer.push(c.buffer);
             blocks.push({ channels: chans });
         }
-        if (pumpStop || !workletNode) return false;
+        if (pumpStop || !S.workletNode) return false;
         try {
-            workletNode.port.postMessage({ type: 'append', base: jsWriteFrontier, frames, tracks: blocks }, transfer);
+            S.workletNode.port.postMessage({ type: 'append', base: jsWriteFrontier, frames, tracks: blocks }, transfer);
         } catch (_) { return false; }
         jsWriteFrontier += frames;
         return true;
@@ -1459,8 +1431,8 @@ import {
             }
             if (pumpStop) return;
             if (isInitial) {
-                buffersReady = true;
-                if (pendingPlay) { pendingPlay = false; transportPlay(); }
+                S.buffersReady = true;
+                if (S.pendingPlay) { S.pendingPlay = false; transportPlay(); }
             }
             while (!pumpStop && jsWriteFrontier < streamTotalSamples) {
                 const target = Math.min(streamTotalSamples,
@@ -1493,8 +1465,8 @@ import {
             // proxy's canonical WAV, but honour a non-canonical one too).
             const byteOffset = t.dataOffset + fromSample * t.byteAlign;
             const headers = { Range: 'bytes=' + byteOffset + '-' };
-            const resp = await fetch(t.url, { signal: abortController.signal, headers });
-            if (gen !== loadGeneration || token !== streamSeekToken) {
+            const resp = await fetch(t.url, { signal: S.abortController.signal, headers });
+            if (gen !== S.loadGeneration || token !== streamSeekToken) {
                 try { resp.body && resp.body.cancel(); } catch (_) {}
                 return;
             }
@@ -1512,12 +1484,12 @@ import {
     // 206-capable proxy, O(offset) discard otherwise.
     async function repositionStream(targetSec) {
         const token = ++streamSeekToken;
-        const gen = loadGeneration;
+        const gen = S.loadGeneration;
         pumpStop = true;
         cancelStreamReaders();
         const Tsamp = Math.max(0, Math.round(targetSec * streamSampleRate));
-        if (workletNode) {
-            try { workletNode.port.postMessage({ type: 'seek', offset: Tsamp / streamSampleRate }); } catch (_) {}
+        if (S.workletNode) {
+            try { S.workletNode.port.postMessage({ type: 'seek', offset: Tsamp / streamSampleRate }); } catch (_) {}
         }
         jsWriteFrontier = Tsamp;
         lastWorkletPos = Tsamp;
@@ -1529,7 +1501,7 @@ import {
             }
             return;
         }
-        if (token !== streamSeekToken || gen !== loadGeneration) return;
+        if (token !== streamSeekToken || gen !== S.loadGeneration) return;
         pumpStop = false;
         runPump(false);
     }
@@ -1540,43 +1512,43 @@ import {
     // module on the new context. Returns true if the context is usable at `rate`.
     async function ensureCtxAtRate(rate) {
         ensureCtx();
-        if (ctx && Math.abs(ctx.sampleRate - rate) < 1) return true;
-        try { if (ctx) { const old = ctx; ctx = null; try { old.close(); } catch (_) {} } } catch (_) {}
-        workletReady = false;
-        workletModulePromise = null;
+        if (S.audioCtx && Math.abs(S.audioCtx.sampleRate - rate) < 1) return true;
+        try { if (S.audioCtx) { const old = S.audioCtx; S.audioCtx = null; try { old.close(); } catch (_) {} } } catch (_) {}
+        S.workletReady = false;
+        S.workletModulePromise = null;
         const AC = window.AudioContext || window.webkitAudioContext;
-        try { ctx = new AC({ sampleRate: rate }); }
-        catch (_) { try { ctx = new AC(); } catch (__) { return false; } }
+        try { S.audioCtx = new AC({ sampleRate: rate }); }
+        catch (_) { try { S.audioCtx = new AC(); } catch (__) { return false; } }
         const ok = await ensureWorklet();
         // If the engine ignored the sampleRate option, we can't feed native-rate
         // PCM without resampling — refuse streaming and let the caller bail.
-        return ok && !!ctx && Math.abs(ctx.sampleRate - rate) < 1;
+        return ok && !!S.audioCtx && Math.abs(S.audioCtx.sampleRate - rate) < 1;
     }
 
     // Build the streaming graph + pump from the fetched WAV streams. `probeResp`
     // is stem[0]'s already-open response. Returns true once set up (the pump
     // runs asynchronously), false on failure. On failure it does NOT teardown()
-    // (that would bump loadGeneration and hide the failure from onSongReady's
+    // (that would bump S.loadGeneration and hide the failure from onSongReady's
     // supersession check) — the caller tears down + falls back. A `false` return
-    // with `gen === loadGeneration` is a real failure; a stale gen is supersession.
+    // with `gen === S.loadGeneration` is a real failure; a stale gen is supersession.
     async function setupStreaming(stems, probeResp, fullUrl, gen) {
         // 1. Open readers + parse headers for every stem (and the full mix).
         let restResps = [];
         try {
             restResps = await Promise.all(stems.slice(1).map((s) =>
-                fetch(s.url, { signal: abortController.signal, headers: { Range: 'bytes=0-' } })));
+                fetch(s.url, { signal: S.abortController.signal, headers: { Range: 'bytes=0-' } })));
         } catch (e) {
-            if (gen !== loadGeneration) return false;
+            if (gen !== S.loadGeneration) return false;
             console.warn('[stems] stem fetch failed; cannot stream:', e);
             return false; // caller (onSongReady) tears down + falls back
         }
-        if (gen !== loadGeneration) return false;
+        if (gen !== S.loadGeneration) return false;
 
         let fullResp = null;
         if (fullUrl) {
             try {
-                const fr = await fetch(fullUrl, { signal: abortController.signal, headers: { Range: 'bytes=0-' } });
-                if (gen !== loadGeneration) { try { fr.body && fr.body.cancel(); } catch (_) {} return false; }
+                const fr = await fetch(fullUrl, { signal: S.abortController.signal, headers: { Range: 'bytes=0-' } });
+                if (gen !== S.loadGeneration) { try { fr.body && fr.body.cancel(); } catch (_) {} return false; }
                 if (isWavResponse(fr)) fullResp = fr; else { try { fr.body && fr.body.cancel(); } catch (_) {} }
             } catch (_) { /* no full mix → separated stems only */ }
         }
@@ -1592,7 +1564,7 @@ import {
                 nch: 2, byteAlign: 4, totalFrames: 0, dataOffset: 44,
             };
             const hdr = await readWavHeader(t);
-            if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
+            if (gen !== S.loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
             if (!hdr) { console.warn('[stems] stem WAV header parse failed; cannot stream'); return false; }
             t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
             t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
@@ -1619,7 +1591,7 @@ import {
                 nch: 2, byteAlign: 4, totalFrames: 0, dataOffset: 44,
             };
             const hdr = await readWavHeader(t);
-            if (gen !== loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
+            if (gen !== S.loadGeneration) { try { t.reader.cancel(); } catch (_) {} return false; }
             // The full mix rides the same sample clock as the stems; the pristine
             // mixdown can be encoded at the source rate (≠ the demucs stem rate),
             // in which case it'd play at the wrong speed. Only keep it when its
@@ -1641,17 +1613,17 @@ import {
 
         // 2. Pin the AudioContext to the source rate + (re)load the worklet.
         const okCtx = await ensureCtxAtRate(streamSampleRate);
-        if (gen !== loadGeneration) return false;
-        if (!okCtx || !ctx) {
+        if (gen !== S.loadGeneration) return false;
+        if (!okCtx || !S.audioCtx) {
             console.warn('[stems] could not run the AudioContext at the stem sample rate; not streaming');
             return false;
         }
-        useWorklet = true;
+        S.useWorklet = true;
 
         // 3. Full-mix tolerance (same rule as buildGraphFromBuffers): only keep
         //    it when its length matches the stems, clamped so it can't extend the
         //    song past where the stems / highway end.
-        fullTrackIndex = -1;
+        S.fullTrackIndex = -1;
         streamTracks = built.slice();
         if (fullTrack) {
             const tol = Math.max(2048, Math.round(0.05 * streamSampleRate));
@@ -1662,24 +1634,24 @@ import {
             } else {
                 fullTrack.totalFrames = Math.min(fullTrack.totalFrames, maxStemFrames);
                 streamTracks.push(fullTrack);
-                fullTrackIndex = built.length;
+                S.fullTrackIndex = built.length;
             }
         }
 
         // 4. Mix graph + stem UI state (mirrors buildGraphFromBuffers, no buffers).
-        masterGain = ctx.createGain();
-        masterGain.gain.value = persistedSongGain();
-        masterGain.connect(ctx.destination);
-        analyserNode = ctx.createAnalyser();
-        analyserNode.fftSize = 256;
-        masterGain.connect(analyserNode);
-        workletPostReady = false;
+        S.masterGain = S.audioCtx.createGain();
+        S.masterGain.gain.value = persistedSongGain();
+        S.masterGain.connect(S.audioCtx.destination);
+        S.analyserNode = S.audioCtx.createAnalyser();
+        S.analyserNode.fftSize = 256;
+        S.masterGain.connect(S.analyserNode);
+        S.workletPostReady = false;
         try {
-            workletNode = new AudioWorkletNode(ctx, 'stem-mixer', {
+            S.workletNode = new AudioWorkletNode(S.audioCtx, 'stem-mixer', {
                 numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
             });
-            workletNode.port.onmessage = onWorkletMessage;
-            workletNode.connect(masterGain);
+            S.workletNode.port.onmessage = onWorkletMessage;
+            S.workletNode.connect(S.masterGain);
         } catch (e) {
             console.warn('[stems] stem-mixer node failed; not streaming:', e);
             return false;
@@ -1687,9 +1659,9 @@ import {
 
         const karaoke = karaokeDefault();
         const defaultMuted = loadDefaultMuted();
-        const savedMuted = loadMuted(currentFilename);
-        const savedVols = loadVolumes(currentFilename);
-        stemState = built.map((t, i) => {
+        const savedMuted = loadMuted(S.currentFilename);
+        const savedVols = loadVolumes(S.currentFilename);
+        S.stemState = built.map((t, i) => {
             const gain = makeStemGainHandle(i);
             let on;
             if (savedMuted) {
@@ -1725,12 +1697,12 @@ import {
             for (const t of streamTracks) t.skipBytes = initialOffsetSamples * t.byteAlign;
         }
 
-        const { stemGains, fullGain } = computeMixGains(stemState, fullTrackIndex >= 0);
+        const { stemGains, fullGain } = computeMixGains(S.stemState, S.fullTrackIndex >= 0);
         const gains = stemGains.slice();
-        if (fullTrackIndex >= 0) gains.push(fullGain);
+        if (S.fullTrackIndex >= 0) gains.push(fullGain);
         const openTracks = streamTracks.map((t) => ({ nch: t.nch, length: t.totalFrames }));
         try {
-            workletNode.port.postMessage({
+            S.workletNode.port.postMessage({
                 type: 'open', tracks: openTracks, gains,
                 sampleRate: streamSampleRate, cap: Math.ceil(STREAM_CAP_SEC * streamSampleRate),
                 startSample: initialOffsetSamples,
@@ -1739,7 +1711,7 @@ import {
             console.warn('[stems] worklet open failed; not streaming:', e);
             return false;
         }
-        workletPostReady = true;
+        S.workletPostReady = true;
         updateLatencyOffset();
 
         pumpStop = false; // teardown() set this true; clear it before pumping
@@ -1764,23 +1736,23 @@ import {
     // ── Song-fader bridge ──
     // audio-mixer.js's "Song" fader probes window.slopsmith.stems.setMasterVolume
     // and routes itself there when present, so the fader can drive every stem
-    // at once via masterGain.
+    // at once via S.masterGain.
     function songFaderHook(linear) {
         const v = Number(linear);
-        if (!Number.isFinite(v) || !masterGain) return;
+        if (!Number.isFinite(v) || !S.masterGain) return;
         // Allow up to 2x (boost), matching the pre-rearchitect setMasterVolume
         // range the mixer's "Song" fader drives — clamping at 1 lost the top
         // half of the fader's boost range.
-        masterGain.gain.value = Math.max(0, Math.min(2, v));
+        S.masterGain.gain.value = Math.max(0, Math.min(2, v));
     }
     function installSongFaderBridge() {
         if (!window.slopsmith) return;
         if (!window.slopsmith.stems || typeof window.slopsmith.stems !== 'object') {
             window.slopsmith.stems = {};
         }
-        if (!songFaderBridgeInstalled) {
-            priorSetMasterVolume = window.slopsmith.stems.setMasterVolume;
-            songFaderBridgeInstalled = true;
+        if (!S.songFaderBridgeInstalled) {
+            S.priorSetMasterVolume = window.slopsmith.stems.setMasterVolume;
+            S.songFaderBridgeInstalled = true;
         }
         window.slopsmith.stems.setMasterVolume = songFaderHook;
     }
@@ -1789,7 +1761,7 @@ import {
     // plugins (e.g. highway_3d) can read the stems instead of #audio, which
     // is now silent. Returns null when no sloppak is loaded.
     function getAnalyser() {
-        return analyserNode;
+        return S.analyserNode;
     }
     function exposeStemsGlobals() {
         if (!window.slopsmith) return;
@@ -1812,9 +1784,9 @@ import {
         // Decide per-song whether the pitch-preserving worklet is available.
         // Done before buildGraphFromBuffers so the graph is built for the right
         // path. Falls back to legacy (pitch-coupling) playback otherwise.
-        useWorklet = await ensureWorklet();
-        if (!useWorklet && !workletWarned) {
-            workletWarned = true;
+        S.useWorklet = await ensureWorklet();
+        if (!S.useWorklet && !S.workletWarned) {
+            S.workletWarned = true;
             console.warn('[stems] AudioWorklet unavailable — speed control will change pitch (legacy mode)');
         }
         // Retry shim install in case #audio wasn't in the DOM when installHooks()
@@ -1827,7 +1799,7 @@ import {
             console.error('[stems] #audio shims unavailable; sloppak playback handed back to core <audio>');
             return;
         }
-        sloppakActive = true;
+        S.sloppakActive = true;
 
         // server.py points the core <audio> at stems[0]. If the user pressed
         // play during the song-load gap (before our shims took over) the core
@@ -1838,23 +1810,23 @@ import {
         const core = document.getElementById('audio');
         if (core) {
             if (!nativeCorePaused(core)) {
-                pendingPlay = true;
+                S.pendingPlay = true;
                 transport.baseOffset = nativeCoreTime(core);
             }
             nativeCorePause(core);
         }
 
-        // teardown() above already bumped loadGeneration; adopt that value as
+        // teardown() above already bumped S.loadGeneration; adopt that value as
         // this load's generation. Nothing else mutates it until the next
         // teardown(), which is exactly what invalidates an in-flight load.
-        const gen = loadGeneration;
-        abortController = new AbortController();
+        const gen = S.loadGeneration;
+        S.abortController = new AbortController();
 
         // Pristine full-mix mixdown, if the pack ships one (core #583 exposes
         // it on song_info). Worklet path only — it rides the same time-stretch
         // graph as an extra track. A failed/absent full mix degrades silently to
         // separated-stems playback (loadFullMix returns null).
-        const fullUrl = (useWorklet && info && info.has_original_audio) ? info.original_audio_url : null;
+        const fullUrl = (S.useWorklet && info && info.has_original_audio) ? info.original_audio_url : null;
 
         // Probe stem[0] to choose the path by Content-Type: the iOS proxy serves
         // `audio/wav` (raw PCM — streamable, bounded memory); desktop serves
@@ -1863,25 +1835,25 @@ import {
         // 206-capable proxy serve efficiently; the current proxy/desktop returns
         // a full 200, which streams fine.
         let probe = null;
-        if (useWorklet && streamingSupported()) {
+        if (S.useWorklet && streamingSupported()) {
             try {
-                probe = await fetch(stems[0].url, { signal: abortController.signal, headers: { Range: 'bytes=0-' } });
+                probe = await fetch(stems[0].url, { signal: S.abortController.signal, headers: { Range: 'bytes=0-' } });
             } catch (e) {
-                if (gen !== loadGeneration) return;
+                if (gen !== S.loadGeneration) return;
                 probe = null;
             }
-            if (gen !== loadGeneration) { try { probe && probe.body && probe.body.cancel(); } catch (_) {} return; }
+            if (gen !== S.loadGeneration) { try { probe && probe.body && probe.body.cancel(); } catch (_) {} return; }
         }
 
         // Capture play intent before graph build — a build failure runs
-        // teardown(), which clears pendingPlay.
-        const wantedPlay = pendingPlay;
+        // teardown(), which clears S.pendingPlay.
+        const wantedPlay = S.pendingPlay;
 
         if (probe && isWavResponse(probe)) {
             const ok = await setupStreaming(stems, probe, fullUrl, gen);
             // setupStreaming does NOT teardown on failure, so a stale gen here is
             // genuine supersession by a newer song (its overlay owns the screen).
-            if (gen !== loadGeneration) return;
+            if (gen !== S.loadGeneration) return;
             if (!ok) {
                 // Real streaming-setup failure. We deliberately do NOT fall back to
                 // the full-decode path here: streaming is only selected for
@@ -1904,7 +1876,7 @@ import {
             hideOverlay();
             injectUI();
             installSongFaderBridge();
-            // buffersReady + pending-play are handled by the streaming pump.
+            // S.buffersReady + pending-play are handled by the streaming pump.
             return;
         }
         // Not streamable (desktop OGG, or streaming unsupported): full-decode.
@@ -1913,8 +1885,8 @@ import {
         let results, fullBuf = null;
         try {
             [results, fullBuf] = await Promise.all([
-                loadStems(stems, gen, abortController.signal),
-                fullUrl ? loadFullMix(fullUrl, gen, abortController.signal) : Promise.resolve(null),
+                loadStems(stems, gen, S.abortController.signal),
+                fullUrl ? loadFullMix(fullUrl, gen, S.abortController.signal) : Promise.resolve(null),
             ]);
         } catch (e) {
             console.error('[stems] loadStems error:', e);
@@ -1922,13 +1894,13 @@ import {
         }
         // Superseded by a newer song while we were decoding — the newer
         // song owns the overlay now, so leave it alone.
-        if (gen !== loadGeneration) return;
+        if (gen !== S.loadGeneration) return;
         if (results === null) { hideOverlay(); return; }
 
         if (!buildGraphFromBuffers(results, fullBuf)) {
             hideOverlay();
             // No stems decoded: teardown() inside buildGraphFromBuffers reverted
-            // to core control (sloppakActive=false), so the #audio shims now
+            // to core control (S.sloppakActive=false), so the #audio shims now
             // delegate natively. We paused core during takeover above — if the
             // user wanted playback, resume it so they aren't stranded on a
             // silent, paused player (degraded single-track playback beats
@@ -1942,17 +1914,17 @@ import {
         hideOverlay();
         injectUI();
         installSongFaderBridge();
-        buffersReady = true;
-        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
+        S.buffersReady = true;
+        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id) });
 
-        if (pendingPlay) { pendingPlay = false; transportPlay(); }
+        if (S.pendingPlay) { S.pendingPlay = false; transportPlay(); }
     }
 
     function songInfoSignature(info) {
         const stems = Array.isArray(info && info.stems) ? info.stems : [];
-        const filename = (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || '';
+        const filename = (info && info.filename) || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || S.currentFilename || '';
         return JSON.stringify({
-            songKey: currentSongKey || '',
+            songKey: S.currentSongKey || '',
             filename,
             stems: stems.map(s => ({ id: s.id, url: s.url, default: !!s.default })),
         });
@@ -1978,25 +1950,25 @@ import {
         const info = highway.getSongInfo && highway.getSongInfo();
         if (!info || !Array.isArray(info.stems)) return false;
         const signature = songInfoSignature(info);
-        if (signature === readySignature) return true;
-        readySignature = signature;
-        currentFilename = info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || currentFilename || null;
+        if (signature === S.readySignature) return true;
+        S.readySignature = signature;
+        S.currentFilename = info.filename || (window.slopsmith && window.slopsmith.currentSong && window.slopsmith.currentSong.filename) || S.currentFilename || null;
         try { onSongReady(); } catch (e) { console.warn('[stems] init failed:', e); }
         return true;
     }
 
     function startReadyPoll() {
-        if (pollHandle !== null) clearInterval(pollHandle);
+        if (S.pollHandle !== null) clearInterval(S.pollHandle);
         let attempts = 0;
         let myHandle;
         myHandle = setInterval(() => {
             attempts++;
             if (tryInitForCurrentSong() || attempts >= 30) {
                 clearInterval(myHandle);
-                if (pollHandle === myHandle) pollHandle = null;
+                if (S.pollHandle === myHandle) S.pollHandle = null;
             }
         }, 200);
-        pollHandle = myHandle;
+        S.pollHandle = myHandle;
     }
 
     // ── Playback lifecycle hooks ──
@@ -2005,23 +1977,23 @@ import {
         hookState.impl = {
             onPlaybackLoading(detail = {}) {
                 const ref = songRefFromDetail(detail);
-                readySignature = null;
+                S.readySignature = null;
                 teardown();
-                currentSongKey = ref.songKey;
-                currentFilename = ref.filename || currentFilename || null;
+                S.currentSongKey = ref.songKey;
+                S.currentFilename = ref.filename || S.currentFilename || null;
             },
             onPlaybackReady(detail = {}) {
                 // A `ready` alias (playback:ready / song:loaded / song:ready)
                 // can fire WITHOUT a preceding `loading` (e.g. re-entering an
-                // already-loaded song). currentSongKey would then be stale and
+                // already-loaded song). S.currentSongKey would then be stale and
                 // mute/volume would persist under the wrong song key (see
                 // storageSongKey / redactedSongRef). Refresh it from the ready
                 // event's own target — but only when the ready detail actually
                 // carries a key, so a keyless ready that follows a good loading
                 // never wipes a valid key.
                 const ref = songRefFromDetail(detail);
-                if (ref.songKey) currentSongKey = ref.songKey;
-                if (ref.filename) currentFilename = ref.filename;
+                if (ref.songKey) S.currentSongKey = ref.songKey;
+                if (ref.filename) S.currentFilename = ref.filename;
                 if (!tryInitForCurrentSong()) startReadyPoll();
             },
             onPlaybackStopped() {
@@ -2030,7 +2002,7 @@ import {
             teardown,
         };
         if (hookState.installed) return;
-        wired = true;
+        S.wired = true;
         hookState.installed = true;
 
         installAudioShims();
@@ -2109,7 +2081,7 @@ import {
 
     function stemStatesSnapshot() {
         const snapshot = {};
-        for (const stem of stemState) {
+        for (const stem of S.stemState) {
             snapshot[stem.id] = { id: stem.id, on: !!stem.on, muted: !stem.on, vol: stem.vol };
         }
         return snapshot;
@@ -2123,7 +2095,7 @@ import {
                 ownerId: 'stems.provider',
                 participantId: 'stems.provider',
                 availability,
-                stemIds: stemState.map(stem => stem.id),
+                stemIds: S.stemState.map(stem => stem.id),
                 stemStates: stemStatesSnapshot(),
             });
         } catch (err) {
@@ -2176,7 +2148,7 @@ import {
 
     function registerStemMixParticipants() {
         unregisterStemMixParticipants();
-        for (const stem of stemState) registerStemMixParticipant(stem);
+        for (const stem of S.stemState) registerStemMixParticipant(stem);
     }
 
     function unregisterStemMixParticipants() {
@@ -2234,40 +2206,40 @@ import {
     }
 
     function capabilityTargets(payload = {}) {
-        if (!stemState.length) return [];
+        if (!S.stemState.length) return [];
         const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
         const id = payload.id || target.id;
-        if (id) return stemState.filter(s => s.id.toLowerCase() === String(id).toLowerCase());
+        if (id) return S.stemState.filter(s => s.id.toLowerCase() === String(id).toLowerCase());
         const selector = String(payload.selector || target.selector || target.kind || '').toLowerCase();
         if (selector === 'guitar') {
-            const guitars = stemState.filter(s => isGuitarStemId(s.id));
-            return guitars.length ? guitars : stemState.filter(s => String(s.id).toLowerCase() === 'other');
+            const guitars = S.stemState.filter(s => isGuitarStemId(s.id));
+            return guitars.length ? guitars : S.stemState.filter(s => String(s.id).toLowerCase() === 'other');
         }
-        return stemState.slice();
+        return S.stemState.slice();
     }
 
-    function claimIdFromContext(ctx) {
-        const payload = ctx && ctx.payload && typeof ctx.payload === 'object' ? ctx.payload : {};
-        const claim = ctx && ctx.claim && typeof ctx.claim === 'object' ? ctx.claim : {};
+    function claimIdFromContext(cmdCtx) {
+        const payload = cmdCtx && cmdCtx.payload && typeof cmdCtx.payload === 'object' ? cmdCtx.payload : {};
+        const claim = cmdCtx && cmdCtx.claim && typeof cmdCtx.claim === 'object' ? cmdCtx.claim : {};
         return payload.claimId || claim.claimId || null;
     }
 
-    function capMute(ctx = {}) {
-        const payload = ctx.payload || {};
+    function capMute(cmdCtx = {}) {
+        const payload = cmdCtx.payload || {};
         const targets = capabilityTargets(payload);
-        if (!stemState.length) {
+        if (!S.stemState.length) {
             return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ mutedIds: [] }) };
         }
         if (!targets.length) {
             return { outcome: 'no-target', reason: 'No matching stem target is available', payload: redactedSongRef({ mutedIds: [] }) };
         }
-        let claimId = claimIdFromContext(ctx);
+        let claimId = claimIdFromContext(cmdCtx);
         const session = audioSessionApi();
         if (session && typeof session.muteStems === 'function') {
             try {
                 const result = session.muteStems({
                     claimId,
-                    requester: ctx.requester || payload.requester || 'stems.capability',
+                    requester: cmdCtx.requester || payload.requester || 'stems.capability',
                     stemIds: targets.map(stem => stem.id),
                     restoreSnapshot: stemStatesSnapshot(),
                 });
@@ -2286,20 +2258,20 @@ import {
         return { outcome: 'handled', payload: redactedSongRef({ claimId, mutedIds }) };
     }
 
-    function capRestore(ctx = {}) {
-        const claimId = claimIdFromContext(ctx);
+    function capRestore(cmdCtx = {}) {
+        const claimId = claimIdFromContext(cmdCtx);
         if (!claimId) {
             return { outcome: 'no-target', reason: 'Restore requires a claimId', payload: redactedSongRef({ restoredIds: [] }) };
         }
         const session = audioSessionApi();
         if (session && typeof session.restoreStems === 'function' && claimId) {
-            try { session.restoreStems({ claimId, requester: ctx.requester || 'stems.capability' }); }
+            try { session.restoreStems({ claimId, requester: cmdCtx.requester || 'stems.capability' }); }
             catch (_) {}
         }
         const restoredIds = [];
         for (const [key, previous] of Array.from(claimSnapshots.entries())) {
             if (previous.claimId !== claimId) continue;
-            const stem = stemState.find(s => s.id === previous.id);
+            const stem = S.stemState.find(s => s.id === previous.id);
             if (stem) {
                 applyStemState(stem, previous.prevOn, previous.prevVol);
                 restoredIds.push(stem.id);
@@ -2316,9 +2288,9 @@ import {
         }
     }
 
-    function capSetVolume(ctx = {}) {
-        const payload = ctx.payload || {};
-        if (!stemState.length) return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ stems: [] }) };
+    function capSetVolume(cmdCtx = {}) {
+        const payload = cmdCtx.payload || {};
+        if (!S.stemState.length) return { outcome: 'no-owner', reason: 'No active stem graph is available', payload: redactedSongRef({ stems: [] }) };
         const committed = stemsApi.setVolume(payload.id || payload.target?.id, payload.vol ?? payload.volume);
         if (committed === undefined) return { outcome: 'no-target', reason: 'No matching stem target is available', payload: capList().payload };
         return { outcome: 'handled', payload: { ...capList().payload, committedValue: committed } };
@@ -2388,8 +2360,8 @@ import {
             },
         });
         registerStemMixParticipants();
-        registerStemOwnerStatus(stemState.length ? 'available' : 'unavailable');
-        emitStemsState('provider-ready', { stemCount: stemState.length, stemIds: stemState.map(s => s.id) });
+        registerStemOwnerStatus(S.stemState.length ? 'available' : 'unavailable');
+        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id) });
     }
 
     /**
@@ -2412,10 +2384,10 @@ import {
      *                        in [0, 1]; out-of-range clamped, NaN ignored.
      *   setMuted(id, muted)  `muted=true` mutes, `false` unmutes. Common
      *                        non-boolean inputs are coerced to false.
-     *   stemState            Live array of internal stem-state objects.
+     *   stemState              Live array of internal stem-state objects.
      */
     const stemsApi = {
-        getState: () => stemState.map(s => ({
+        getState: () => S.stemState.map(s => ({
             id: s.id, vol: s.vol, on: s.on, gain: s.gain, audio: null,
         })),
         setVolume(id, vol) {
@@ -2425,7 +2397,7 @@ import {
             const clamped = clampVolume(v);
             if (clamped == null) return undefined;
             let applied = false;
-            for (const s of stemState) {
+            for (const s of S.stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 setStemVolume(s, clamped);
                 applied = true;
@@ -2437,19 +2409,19 @@ import {
             const m = coerceBool(muted);
             const target = String(id).toLowerCase();
             let applied = false;
-            for (const s of stemState) {
+            for (const s of S.stemState) {
                 if (s.id.toLowerCase() !== target) continue;
                 s.on = !m;
                 if (s.gain) s.gain.gain.value = s.on ? s.vol : 0;
                 updateStemButton(s);
-                saveMuted(storageSongKey(), stemState);
+                saveMuted(storageSongKey(), S.stemState);
                 applied = true;
             }
             if (applied) registerStemOwnerStatus('available');
         },
     };
     Object.defineProperty(stemsApi, 'stemState', {
-        get: () => stemState, enumerable: true,
+        get: () => S.stemState, enumerable: true,
     });
 
     // Don't clobber an existing window.stems set by another plugin —

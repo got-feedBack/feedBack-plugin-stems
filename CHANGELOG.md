@@ -6,6 +6,20 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 4b — the reassigned scalars → `S` object in
+  `src/state.js` (R1 pilot).** The ~28 reassigned module scalars (the audio graph
+  `audioCtx`/`masterGain`/`analyserNode`, `stemState`, the worklet + decode flags,
+  the current-song fields) move into a single exported `S` object — because ES
+  imports are read-only bindings, `export let x` can't be reassigned from
+  `main.js`, but `S.x = …` can. Every `main.js` reference becomes `S.x`
+  (~230 sites). The AudioContext is exported as `S.audioCtx` and the four
+  capability-command functions' local `ctx` param was renamed to `cmdCtx` first,
+  so the rewrite was collision-free (verified: 0 bare references, 0 double-prefix,
+  no property-key/shorthand hazards). Move-only, no behaviour change. Verified:
+  node 31/31, pytest 10/10, `import-x/no-cycle` clean on the 6-module graph, and
+  the graph boots + executes in-browser against core-with-R0. **Not yet
+  exercised: real playback** (needs a seeded stems song) — on-device smoke
+  recommended before release.
 - **ES-module migration, step 4a — extract the state containers to `src/state.js`
   (R1 pilot).** The data-structure state that is never reassigned — the
   `transport` object (playhead/rate/duration clock) and the
