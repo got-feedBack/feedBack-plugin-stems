@@ -6,6 +6,47 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 10 — extract the streaming path to
+  `src/streaming.js`.** The bounded-memory iOS WAV streaming layer (the
+  reader/WAV helpers, the worklet-feed pump + its seek/reposition, `setupStreaming`,
+  and `streamOffsetBuffered`/`streamingSupported`/`isWavResponse`) moves out of
+  `main.js` into its own module (~440 lines). The one static cycle it would create
+  — the pump resuming a deferred play via `transportPlay`, plus `persistedSongGain`
+  and the shared `onWorkletMessage`, all in `main.js` — is broken with an injected
+  `configureStreaming({ startPendingPlay, songGain, onWorkletMessage })` seam
+  (transport already imports back into streaming). New `tests/streaming.test.mjs`
+  covers the pure exports. Move-only, no behaviour change; on-device seek/playback
+  smoke passed.
+- **ES-module migration, step 9.1 — guard the streaming pump against seek races.**
+  A pre-existing race (surfaced by review of the step-9 lift): `repositionStream`
+  cancels + reopens track readers on the same objects and clears `pumpStop` before
+  older pump/`appendRound` continuations exit, so a stale append could post
+  misaligned data or steal PCM from the new pump. Fix: a per-run seek token,
+  re-checked before each track read and before posting; a stranded `posWaiter`
+  resolved on stop; and `repositionStream` restarts as `runPump(!S.buffersReady)`
+  so a seek during the initial prefill still establishes readiness. On-device
+  seek-stress smoke passed.
+- **ES-module migration, step 9 — streaming scalars → `ST` object in
+  `src/state.js`.** The 9 reassigned streaming-path scalars (`streaming`,
+  `streamTracks`, `streamSampleRate`/`streamTotalSamples`, `jsWriteFrontier`,
+  `pumpStop`, `lastWorkletPos`, `posWaiter`, `streamSeekToken`) move into an `ST`
+  container (same read-only-binding reason as `S`), read across transport +
+  `onWorkletMessage` + `onSongReady`. Move-only, no behaviour change.
+- **ES-module migration, step 8 — shim scalars → `SH` object in `src/state.js`.**
+  The 7 `#audio`-shim scalars (`shimsInstalled`/`shimsUsable` + the captured core
+  descriptors and native play/pause) move into an `SH` container; `SH.shimsUsable`
+  gates the sloppak takeover from transport + `onSongReady`. Move-only.
+- **ES-module migration, step 7 — extract mix routing to `src/mix.js`.**
+  `applyMixRouting` (posts worklet gains) + `makeStemGainHandle` (the per-stem
+  GainNode stand-in) move out of `main.js`; pairs with the pure `mix-gains.js`.
+  New `tests/mix.test.mjs` covers the previously-untested gain-handle write path.
+- **ES-module migration, step 6 — extract the AudioContext/worklet lifecycle to
+  `src/audio-ctx.js`.** `ensureCtx`/`resumeCtx`/`ensureWorklet`/`ensureCtxAtRate`/
+  `updateLatencyOffset` (+ the `WORKLET_URL` const) — the leaf tier that touches
+  only shared state + native Web Audio — move out of `main.js`.
+- **ES-module migration, step 5 — extract pure helpers to `src/util.js`.**
+  `clampVolume`, `coerceBool`, `hashString` (FNV-1a), `isGuitarStemId` move to
+  their own module with real-import tests.
 - **ES-module migration, step 4b — the reassigned scalars → `S` object in
   `src/state.js` (R1 pilot).** The ~28 reassigned module scalars (the audio graph
   `audioCtx`/`masterGain`/`analyserNode`, `stemState`, the worklet + decode flags,
