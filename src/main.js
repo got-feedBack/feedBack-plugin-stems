@@ -1,5 +1,10 @@
 import { computeMixGains } from './mix-gains.js';
 import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
+import {
+    karaokeDefault, setKaraokeDefault,
+    loadDefaultMuted, saveDefaultMuted,
+    loadMuted, saveMuted, loadVolumes, saveVolume,
+} from './prefs.js';
 
 (function () {
     'use strict';
@@ -24,11 +29,8 @@ import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
     const OFF_CLASS = 'px-2 py-1 bg-dark-600 hover:bg-dark-500 rounded-md text-[11px] text-gray-400 transition';
     const ON_CLASS  = 'px-2 py-1 bg-accent/30 hover:bg-accent/40 rounded-md text-[11px] text-accent-light transition';
 
-    const KARAOKE_KEY = 'stemsKaraokeDefault';
-    const DEFAULT_MUTED_KEY = 'stemsDefaultMuted'; // JSON array of stem ids
+    // Persistence keys + load/save helpers → src/prefs.js (imported above).
     const COMMON_STEMS = ['guitar', 'bass', 'drums', 'vocals', 'piano', 'other'];
-    const MUTE_KEY_PREFIX = 'stemsMute:';  // per-song muted stem ids
-    const VOL_KEY_PREFIX = 'stemsVol:';    // per-song volume overrides (id -> 0..1)
     const DRAG_THRESHOLD_PX = 4;
     const KEYBOARD_VOLUME_STEP = 0.02;
     const KEYBOARD_VOLUME_STEP_LARGE = 0.1;
@@ -42,49 +44,6 @@ import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
     // Worklet from our own assets/ (no CDN). From src/main.js, assets/ is one
     // level up; import.meta.url is the module URL (currentScript is null here).
     const WORKLET_URL = new URL('../assets/stretch-worklet.js', import.meta.url).href;
-
-    function loadDefaultMuted() {
-        try {
-            const raw = localStorage.getItem(DEFAULT_MUTED_KEY);
-            const arr = raw ? JSON.parse(raw) : [];
-            return new Set(Array.isArray(arr) ? arr : []);
-        } catch (_) { return new Set(); }
-    }
-    function saveDefaultMuted(set) {
-        try { localStorage.setItem(DEFAULT_MUTED_KEY, JSON.stringify([...set])); }
-        catch (_) {}
-    }
-
-    function loadMuted(filename) {
-        if (!filename) return null;
-        try {
-            const raw = localStorage.getItem(MUTE_KEY_PREFIX + filename);
-            if (!raw) return null;
-            const arr = JSON.parse(raw);
-            return Array.isArray(arr) ? new Set(arr) : null;
-        } catch (_) { return null; }
-    }
-    function saveMuted(filename, stemStateArr) {
-        if (!filename) return;
-        const muted = stemStateArr.filter(s => !s.on).map(s => s.id);
-        try { localStorage.setItem(MUTE_KEY_PREFIX + filename, JSON.stringify(muted)); }
-        catch (_) {}
-    }
-    function loadVolumes(filename) {
-        if (!filename) return {};
-        try {
-            const raw = localStorage.getItem(VOL_KEY_PREFIX + filename);
-            return raw ? (JSON.parse(raw) || {}) : {};
-        } catch (_) { return {}; }
-    }
-    function saveVolume(filename, id, vol) {
-        if (!filename) return;
-        try {
-            const cur = loadVolumes(filename);
-            cur[id] = vol;
-            localStorage.setItem(VOL_KEY_PREFIX + filename, JSON.stringify(cur));
-        } catch (_) {}
-    }
 
     // ── Plugin state ──
     let ctx = null;                    // shared AudioContext (reused across songs)
@@ -180,9 +139,9 @@ import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
     // ── Settings ──
     const karaokeToggle = document.getElementById('stems-toggle-karaoke');
     if (karaokeToggle) {
-        karaokeToggle.checked = localStorage.getItem(KARAOKE_KEY) === '1';
+        karaokeToggle.checked = karaokeDefault();
         karaokeToggle.addEventListener('change', () => {
-            localStorage.setItem(KARAOKE_KEY, karaokeToggle.checked ? '1' : '0');
+            setKaraokeDefault(karaokeToggle.checked);
         });
     }
     const defMutedHost = document.getElementById('stems-toggle-startup-muted');
@@ -205,9 +164,6 @@ import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
             lbl.appendChild(document.createTextNode(' ' + id));
             defMutedHost.appendChild(lbl);
         }
-    }
-    function karaokeDefault() {
-        return localStorage.getItem(KARAOKE_KEY) === '1';
     }
 
     function clampVolume(volume) {
