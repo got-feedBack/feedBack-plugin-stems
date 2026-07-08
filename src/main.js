@@ -5,6 +5,9 @@ import {
     loadDefaultMuted, saveDefaultMuted,
     loadMuted, saveMuted, loadVolumes, saveVolume,
 } from './prefs.js';
+import {
+    transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
+} from './state.js';
 
 (function () {
     'use strict';
@@ -60,24 +63,12 @@ import {
     let container = null;              // UI container in #player-controls
     let currentFilename = null;
     let currentSongKey = null;
-    const registeredMixParticipantIds = new Set();
     // Pending poll fallback for the cold-load race. Tracked at module
     // scope so teardown() can cancel it whenever the previous play is
     // abandoned (new song, or leaving the player).
     let pollHandle = null;
     let readySignature = null;
-    const pointerCleanupHandlers = new Set();
-    const claimSnapshots = new Map();  // claimId:stemId -> previous session-only state
-
-    // ── Transport state ──
-    // The buffer transport replaces the 6 HTMLMediaElement decoder clocks.
-    const transport = {
-        playing: false,
-        baseOffset: 0,     // playhead (s) captured at baseCtxTime
-        baseCtxTime: 0,    // ctx.currentTime when the current run started
-        rate: 1,           // uniform AudioBufferSourceNode.playbackRate
-        duration: 0,       // max decoded buffer length (s)
-    };
+    // transport + the Set/Map state containers → src/state.js (imported above).
     let sloppakActive = false;         // true while a sloppak owns #audio transport
     let buffersReady = false;          // true once all stems are decoded + graphed
     let pendingPlay = false;           // a play() arrived before buffers were ready
