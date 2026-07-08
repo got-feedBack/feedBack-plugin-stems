@@ -1,25 +1,11 @@
-// Unit test for the pure `computeMixGains` decision in src/main.js — the routing
-// that plays the pristine full mix when every stem is at unity and switches to
-// the separated stems the moment one is muted/attenuated (feedBack#580 / core
-// #583). Extracts the marker-delimited pure function from the source and evals
-// it (same source-eval approach as stretch-worklet.test.mjs).
-// Run with:  node tests/mix-routing.test.mjs
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+// Unit test for the pure `computeMixGains` decision (src/mix-gains.js) — the
+// routing that plays the pristine full mix when every stem is at unity and
+// switches to the separated stems the moment one is muted/attenuated
+// (feedBack#580 / core #583). Real ES-module import — the marker/eval source
+// extraction is retired now that the function lives in its own module.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-
-// Pull the pure function out of the IIFE (it touches no DOM/closure state).
-// Capture from `function computeMixGains` up to the `// --- end computeMixGains`
-// marker that immediately follows its closing brace — no indentation assumption,
-// so it survives reformatting of the body.
-const m = src.match(/(function computeMixGains[\s\S]*?)\n\s*\/\/ --- end computeMixGains ---/);
-assert.ok(m, 'computeMixGains block (between markers) not found in src/main.js');
-const computeMixGains = eval('(' + m[1] + ')');
+import { computeMixGains } from '../src/mix-gains.js';
 
 const S = (on, vol) => ({ on, vol });
 

@@ -6,6 +6,14 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 2 — first pure-module extractions (R1 pilot).**
+  The pure helpers move out of `src/main.js` into their own modules:
+  `computeMixGains` → `src/mix-gains.js`, and `parseWavHeader` /
+  `pcm16ToFloat32` → `src/wav-pcm.js` (`main.js` imports them at module top).
+  Their tests (`mix-routing`, `wav-pcm`) drop the marker-comment /`eval` source
+  extraction for **real ES-module imports** — the first retirement of the
+  `@pure`-style harness. Move-only, zero behaviour change; 24/24 node + 10/10
+  pytest, and the 3-module graph boots in-browser against core-with-R0.
 - **ES-module migration, step 1 — the bootstrap flip (R1 pilot).** `screen.js`
   is now a one-line `import './src/main.js'` and the plugin declares
   `"scriptType": "module"` (+ `"minHost": "0.3.0-alpha.1"`); the host injects it
