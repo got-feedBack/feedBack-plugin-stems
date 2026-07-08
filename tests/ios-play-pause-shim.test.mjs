@@ -16,7 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 
 test('play/pause shims use defineProperty, not the assignment that throws on iOS', () => {
     // Strip full-line comments first: the surrounding comment in screen.js

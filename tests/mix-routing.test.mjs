@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 
 // Pull the pure function out of the IIFE (it touches no DOM/closure state).
 // Capture from `function computeMixGains` up to the `// --- end computeMixGains`

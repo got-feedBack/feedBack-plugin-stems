@@ -9,6 +9,8 @@
     "category": "audio"
   },
   "script": "screen.js",
+  "scriptType": "module",
+  "minHost": "0.3.0-alpha.1",
   "category": "audio",
   "description": "Separate and control individual song stems.",
   "icon": "assets/thumb.svg",

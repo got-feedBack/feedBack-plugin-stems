@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(__dirname, '..', 'screen.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 
 function extract(name) {
     const re = new RegExp('(function ' + name + '[\\s\\S]*?)\\n\\s*// --- end ' + name + ' ---');

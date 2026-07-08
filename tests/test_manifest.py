@@ -41,7 +41,7 @@ def test_manifest_declares_playback_observer_for_lifecycle_migration():
 
 
 def test_screen_no_longer_wraps_window_play_song():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "window.playSong =" not in src
     assert "basePlaySong" not in src
@@ -62,7 +62,7 @@ def test_manifest_declares_audio_mix_fader_provider():
 
 
 def test_screen_uses_008_audio_session_contracts():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "registerStemOwner" in src
     assert "recordStemManualOverride" in src
@@ -71,7 +71,7 @@ def test_screen_uses_008_audio_session_contracts():
 
 
 def test_screen_uses_buffer_transport_shims_via_property_handlers():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     # play/pause are installed with Object.defineProperty rather than a plain
     # `core.play = fn` assignment: iOS WebKit exposes HTMLMediaElement.play /
@@ -87,7 +87,7 @@ def test_screen_uses_buffer_transport_shims_via_property_handlers():
 
 
 def test_screen_reports_empty_mute_targets_as_unhandled():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "outcome: 'no-owner'" in src
     assert "outcome: 'no-target'" in src
@@ -95,7 +95,7 @@ def test_screen_reports_empty_mute_targets_as_unhandled():
 
 
 def test_screen_redacts_song_identity_from_capability_payloads():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "currentSongKey" in src
     assert "redactedSongRef" in src
@@ -105,7 +105,7 @@ def test_screen_redacts_song_identity_from_capability_payloads():
 
 
 def test_screen_reports_missing_set_volume_target():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "const committed = stemsApi.setVolume" in src
     assert "if (committed === undefined)" in src
@@ -114,7 +114,7 @@ def test_screen_reports_missing_set_volume_target():
 
 
 def test_screen_requires_claim_id_for_restore():
-    src = (ROOT / "screen.js").read_text(encoding="utf-8")
+    src = (ROOT / "src" / "main.js").read_text(encoding="utf-8")
 
     assert "Restore requires a claimId" in src
     assert "if (previous.claimId !== claimId) continue" in src
