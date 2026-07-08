@@ -6,6 +6,16 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 11.1 — streaming/transport hardening.** (1) Guard
+  `handleNaturalEnd()` on `transport.playing`: in worklet mode a queued `ended`
+  message could arrive just after a user pause/stop flipped `playing=false` and
+  dispatch a spurious `ended`, jumping the playhead to `duration` (pre-existing;
+  buffer mode was already safe via `onended=null`). (2) Export `appendRound` +
+  add unit tests pinning the step-9.1 seek-token guard (posts only when the token
+  still matches; drops the block otherwise). (3) Document the synchronous
+  `t.done=true` invariant in `cancelStreamReaders` that makes reader-reopen
+  seek-safe (so the immutable-track refactor isn't needed — the steal is
+  unreachable given that invariant + the per-track token guard).
 - **ES-module migration, step 11 — extract the buffer transport + `#audio` shims
   to `src/transport.js`.** The top of the playback engine moves out of `main.js`:
   the playhead clock (`transportPlayhead`/`Raw`), source start/stop

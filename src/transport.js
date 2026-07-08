@@ -283,7 +283,13 @@ function setTransportRate(r) {
 }
 
 function handleNaturalEnd() {
-    if (!S.sloppakActive) return;
+    // Guard on active playback: in worklet mode a queued 'ended' can arrive just
+    // after transportPause()/lightStop() flipped playing=false (stopSources posts
+    // 'stop' but can't unqueue an in-flight 'ended'), which would otherwise
+    // dispatch a spurious 'ended' and jump the playhead to duration. No genuine
+    // natural-end enters with playing===false (it's set false below). (Buffer mode
+    // is already safe — stopSources nulls src.onended before stop().)
+    if (!S.sloppakActive || !transport.playing) return;
     transport.baseOffset = transport.duration;
     transport.playing = false;
     stopSources();
