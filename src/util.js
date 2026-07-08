@@ -8,8 +8,8 @@ export function clampVolume(volume) {
     return Math.max(0, Math.min(1, numeric));
 }
 
-// Coerce common non-boolean inputs ('false', '0', '', null) to false so external
-// callers can't accidentally mute by passing a string.
+// Coerce common non-boolean inputs ('false', '0', '', null, undefined) to false
+// so external callers can't accidentally mute by passing a string.
 export function coerceBool(v) {
     if (v === 'false' || v === '0' || v === '' || v == null) return false;
     return Boolean(v);

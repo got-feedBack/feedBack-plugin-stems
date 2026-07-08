@@ -24,6 +24,7 @@ test('hashString is stable, base36, and non-empty', () => {
     assert.equal(hashString('abc'), hashString('abc'));
     assert.notEqual(hashString('abc'), hashString('abd'));
     assert.match(hashString('song.sloppak'), /^[0-9a-z]+$/);
+    assert.ok(hashString('').length > 0);             // never empty, even for ''
     assert.equal(hashString(null), hashString(''));   // null → ''
 });
 
