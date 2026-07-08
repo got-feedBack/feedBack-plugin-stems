@@ -6,6 +6,16 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **ES-module migration, step 4a — extract the state containers to `src/state.js`
+  (R1 pilot).** The data-structure state that is never reassigned — the
+  `transport` object (playhead/rate/duration clock) and the `registeredMix
+  ParticipantIds` / `pointerCleanupHandlers` / `claimSnapshots` Set/Map
+  containers — moves to `src/state.js` as `export const`. Because these are only
+  *mutated* (never reassigned), `main.js` imports them with **zero reference
+  changes** at the ~90 call sites. The reassigned scalars (`ctx`, `stemState`,
+  `masterGain`, `workletNode`, …) stay in `main.js` for the follow-up accessor
+  refactor. Move-only, zero behaviour change; 31/31 node + 10/10 pytest,
+  5-module graph boots against core-with-R0.
 - **ES-module migration, step 3 — extract the persistence layer to `src/prefs.js`
   (R1 pilot).** The localStorage helpers (`loadDefaultMuted`/`saveDefaultMuted`,
   `loadMuted`/`saveMuted`, `loadVolumes`/`saveVolume`, `karaokeDefault` + a new
