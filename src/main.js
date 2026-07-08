@@ -11,7 +11,7 @@ import {
     loadMuted, saveMuted, loadVolumes, saveVolume,
 } from './prefs.js';
 import {
-    S, transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
+    S, SH, transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
 } from './state.js';
 
 (function () {
@@ -457,30 +457,25 @@ import {
     // Installed once. Each member delegates to the captured core
     // implementation when no sloppak is active, so archive songs and the JUCE
     // desktop path behave exactly as before.
-    let shimsInstalled = false;        // re-entry guard (prevents recapture/double-define)
-    let shimsUsable = false;           // critical shims (currentTime + play + pause) all succeeded
-    let coreCurrentTimeDesc = null;
-    let corePausedDesc = null;
-    let coreDurationDesc = null;
-    let coreNativePlay = null;
-    let coreNativePause = null;
+    // Shim state (SH.shimsInstalled/SH.shimsUsable + captured core descriptors) → SH in
+    // state.js (reassigned scalars need a container; read across transport too).
 
     function nativeCorePaused(core) {
         try {
-            if (corePausedDesc && corePausedDesc.get) return corePausedDesc.get.call(core);
+            if (SH.corePausedDesc && SH.corePausedDesc.get) return SH.corePausedDesc.get.call(core);
             return core.paused;
         } catch (_) { return true; }
     }
     function nativeCorePause(core) {
         try {
-            if (typeof coreNativePause === 'function') coreNativePause();
+            if (typeof SH.coreNativePause === 'function') SH.coreNativePause();
             else core.pause();
         } catch (_) {}
     }
     function nativeCoreTime(core) {
         try {
-            if (coreCurrentTimeDesc && coreCurrentTimeDesc.get) {
-                const t = Number(coreCurrentTimeDesc.get.call(core));
+            if (SH.coreCurrentTimeDesc && SH.coreCurrentTimeDesc.get) {
+                const t = Number(SH.coreCurrentTimeDesc.get.call(core));
                 return Number.isFinite(t) ? Math.max(0, t) : 0;
             }
             const t = Number(core.currentTime);
@@ -489,25 +484,25 @@ import {
     }
 
     function installAudioShims() {
-        if (shimsInstalled) return;
+        if (SH.shimsInstalled) return;
         const core = document.getElementById('audio');
         if (!core) return;  // #audio not in DOM yet — retry-able from onSongReady().
 
         // From this point we begin mutating `core`: capture descriptors and
         // attempt shims. Flip the re-entry guard NOW so a retry call doesn't
         // recapture our own shimmed descriptors (which would self-recurse on
-        // delegation). `shimsUsable` separately tracks whether the critical
+        // delegation). `SH.shimsUsable` separately tracks whether the critical
         // shims actually succeeded; onSongReady() gates the transport on that.
-        shimsInstalled = true;
+        SH.shimsInstalled = true;
 
-        coreCurrentTimeDesc = Object.getOwnPropertyDescriptor(core, 'currentTime')
+        SH.coreCurrentTimeDesc = Object.getOwnPropertyDescriptor(core, 'currentTime')
             || Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
-        corePausedDesc = Object.getOwnPropertyDescriptor(core, 'paused')
+        SH.corePausedDesc = Object.getOwnPropertyDescriptor(core, 'paused')
             || Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
-        coreDurationDesc = Object.getOwnPropertyDescriptor(core, 'duration')
+        SH.coreDurationDesc = Object.getOwnPropertyDescriptor(core, 'duration')
             || Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'duration');
-        coreNativePlay = core.play.bind(core);
-        coreNativePause = core.pause.bind(core);
+        SH.coreNativePlay = core.play.bind(core);
+        SH.coreNativePause = core.pause.bind(core);
 
         // Track success of the three CRITICAL shims (currentTime + play + pause).
         // Without all three the transport can't drive the highway, so onSongReady()
@@ -517,40 +512,40 @@ import {
         // Each shim is installed independently and defensively: Object.defineProperty
         // can throw on some runtimes, and a single failure must not abort the rest
         // of plugin init. A member that fails to shim simply keeps native behaviour.
-        if (coreCurrentTimeDesc && coreCurrentTimeDesc.get) {
+        if (SH.coreCurrentTimeDesc && SH.coreCurrentTimeDesc.get) {
             try {
                 Object.defineProperty(core, 'currentTime', {
                     configurable: true,
                     get() {
                         if (S.sloppakActive) return transportPlayhead();
-                        return coreCurrentTimeDesc.get.call(this);
+                        return SH.coreCurrentTimeDesc.get.call(this);
                     },
                     set(v) {
                         if (S.sloppakActive) { transportSeek(v); return; }
-                        if (coreCurrentTimeDesc.set) coreCurrentTimeDesc.set.call(this, v);
+                        if (SH.coreCurrentTimeDesc.set) SH.coreCurrentTimeDesc.set.call(this, v);
                     },
                 });
                 ctOk = true;
             } catch (e) { console.warn('[stems] currentTime shim install failed:', e); }
         }
-        if (corePausedDesc && corePausedDesc.get) {
+        if (SH.corePausedDesc && SH.corePausedDesc.get) {
             try {
                 Object.defineProperty(core, 'paused', {
                     configurable: true,
                     get() {
                         if (S.sloppakActive) return !transport.playing;
-                        return corePausedDesc.get.call(this);
+                        return SH.corePausedDesc.get.call(this);
                     },
                 });
             } catch (e) { console.warn('[stems] paused shim install failed:', e); }
         }
-        if (coreDurationDesc && coreDurationDesc.get) {
+        if (SH.coreDurationDesc && SH.coreDurationDesc.get) {
             try {
                 Object.defineProperty(core, 'duration', {
                     configurable: true,
                     get() {
                         if (S.sloppakActive && transport.duration > 0) return transport.duration;
-                        return coreDurationDesc.get.call(this);
+                        return SH.coreDurationDesc.get.call(this);
                     },
                 });
             } catch (e) { console.warn('[stems] duration shim install failed:', e); }
@@ -579,7 +574,7 @@ import {
                         if (transport.playing || !S.pendingPlay) return Promise.resolve();
                         return new Promise((resolve) => { S.pendingPlayResolvers.push(resolve); });
                     }
-                    return coreNativePlay();
+                    return SH.coreNativePlay();
                 },
             });
             playOk = true;
@@ -590,7 +585,7 @@ import {
                 writable: true,
                 value: function () {
                     if (S.sloppakActive) { transportPause(); return; }
-                    return coreNativePause();
+                    return SH.coreNativePause();
                 },
             });
             pauseOk = true;
@@ -601,7 +596,7 @@ import {
             if (S.sloppakActive) setTransportRate(core.playbackRate);
         });
 
-        shimsUsable = ctOk && playOk && pauseOk;
+        SH.shimsUsable = ctOk && playOk && pauseOk;
     }
 
     // ── Loading overlay ──
@@ -1650,7 +1645,7 @@ import {
         // refuse the takeover and let core's native <audio> play the guitar
         // stem alone (degraded, but better than a non-functional transport).
         installAudioShims();
-        if (!shimsUsable) {
+        if (!SH.shimsUsable) {
             console.error('[stems] #audio shims unavailable; sloppak playback handed back to core <audio>');
             return;
         }
