@@ -11,7 +11,7 @@ import {
     loadMuted, saveMuted, loadVolumes, saveVolume,
 } from './prefs.js';
 import {
-    S, SH, transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
+    S, SH, ST, transport, registeredMixParticipantIds, pointerCleanupHandlers, claimSnapshots,
 } from './state.js';
 
 (function () {
@@ -140,7 +140,7 @@ import {
             // Streaming backpressure: the worklet reports its read frontier so
             // the pump can top the bounded window up ahead of it.
             if (typeof msg.pos === 'number') {
-                lastWorkletPos = msg.pos;
+                ST.lastWorkletPos = msg.pos;
                 // Re-baseline the transport clock to the worklet's AUTHORITATIVE
                 // read frontier. Without this, an under-run stall (worklet holds
                 // pos, main clock keeps advancing off AudioContext.currentTime)
@@ -149,12 +149,12 @@ import {
                 // highway during a stall (each urgent 'pos' resets it to the held
                 // pos), so it stays in sync. Steady playback is a near-no-op (both
                 // clocks track the audio clock at the same rate).
-                if (streaming && transport.playing && S.audioCtx && streamSampleRate > 0) {
-                    transport.baseOffset = msg.pos / streamSampleRate;
+                if (ST.streaming && transport.playing && S.audioCtx && ST.streamSampleRate > 0) {
+                    transport.baseOffset = msg.pos / ST.streamSampleRate;
                     transport.baseCtxTime = S.audioCtx.currentTime;
                 }
             }
-            if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
+            if (ST.posWaiter) { const r = ST.posWaiter; ST.posWaiter = null; try { r(); } catch (_) {} }
         }
     }
 
@@ -320,10 +320,10 @@ import {
     // song ended and the pump drained the window to the tail — the worklet would
     // read silence, so the caller must refetch (repositionStream) first.
     function streamOffsetBuffered(offset) {
-        if (!streaming || streamSampleRate <= 0) return true;
-        const posSamp = Math.round(offset * streamSampleRate);
-        const behind = Math.ceil(0.1 * streamSampleRate);
-        return posSamp >= lastWorkletPos - behind && posSamp <= jsWriteFrontier;
+        if (!ST.streaming || ST.streamSampleRate <= 0) return true;
+        const posSamp = Math.round(offset * ST.streamSampleRate);
+        const behind = Math.ceil(0.1 * ST.streamSampleRate);
+        return posSamp >= ST.lastWorkletPos - behind && posSamp <= ST.jsWriteFrontier;
     }
 
     function transportPlay() {
@@ -335,7 +335,7 @@ import {
         // Streaming: if the window doesn't cover this offset (replay from 0 after
         // EOF, or the pump has drained), refetch from here before starting. The
         // worklet stalls to silence until the refill reaches `offset`, then plays.
-        if (streaming && !streamOffsetBuffered(offset)) {
+        if (ST.streaming && !streamOffsetBuffered(offset)) {
             transport.baseOffset = offset;
             repositionStream(offset);
         }
@@ -382,7 +382,7 @@ import {
         let target = Number(t);
         if (!Number.isFinite(target)) return;
         target = Math.max(0, dur > 0 ? Math.min(target, dur) : target);
-        if (streaming) {
+        if (ST.streaming) {
             // Streaming: flush the bounded window and refetch every track from
             // the target (repositionStream posts the worklet 'seek'). Re-baseline
             // the clock; works whether or not we're currently playing.
@@ -1155,15 +1155,10 @@ import {
     const STREAM_CHUNK_FRAMES = 8192;  // max frames appended per pump round
     const EMPTY_BYTES = new Uint8Array(0);
 
-    let streaming = false;             // this song is using the streaming path
-    let streamTracks = [];             // [{ url, nch, byteAlign, totalFrames, reader, leftover, done, skipBytes }]
-    let streamSampleRate = 0;
-    let streamTotalSamples = 0;        // transport length in samples (max stem)
-    let jsWriteFrontier = 0;           // next absolute sample the pump will append
-    let pumpStop = false;
-    let lastWorkletPos = 0;            // worklet read frontier (samples), via 'pos'
-    let posWaiter = null;              // resolve fn for a pump await on next 'pos'
-    let streamSeekToken = 0;           // invalidates a superseded seek refetch
+    // Streaming-path state (this-song flag, track readers, sample-rate/length,
+    // pump write-frontier + stop flag, worklet read-frontier + pos-waiter, seek
+    // token) → ST in state.js. Reassigned scalars need a container; read across
+    // the transport layer + onWorkletMessage + onSongReady, so shared, not local.
 
     function streamingSupported() {
         return typeof ReadableStream !== 'undefined'
@@ -1244,17 +1239,17 @@ import {
     // Append one aligned block for every track at the current write frontier,
     // reading PCM as needed and zero-padding tracks past their own end.
     async function appendRound() {
-        const remaining = streamTotalSamples - jsWriteFrontier;
+        const remaining = ST.streamTotalSamples - ST.jsWriteFrontier;
         if (remaining <= 0) return false;
-        const aheadTarget = Math.min(streamTotalSamples,
-            lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * streamSampleRate));
-        const frames = Math.min(STREAM_CHUNK_FRAMES, remaining, Math.max(0, aheadTarget - jsWriteFrontier));
+        const aheadTarget = Math.min(ST.streamTotalSamples,
+            ST.lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * ST.streamSampleRate));
+        const frames = Math.min(STREAM_CHUNK_FRAMES, remaining, Math.max(0, aheadTarget - ST.jsWriteFrontier));
         if (frames <= 0) return false;
 
         const blocks = [];
         const transfer = [];
-        for (const t of streamTracks) {
-            const realWanted = Math.max(0, Math.min(frames, t.totalFrames - jsWriteFrontier));
+        for (const t of ST.streamTracks) {
+            const realWanted = Math.max(0, Math.min(frames, t.totalFrames - ST.jsWriteFrontier));
             let chans;
             if (realWanted <= 0) {
                 chans = [];
@@ -1273,19 +1268,19 @@ import {
             for (const c of chans) transfer.push(c.buffer);
             blocks.push({ channels: chans });
         }
-        if (pumpStop || !S.workletNode) return false;
+        if (ST.pumpStop || !S.workletNode) return false;
         try {
-            S.workletNode.port.postMessage({ type: 'append', base: jsWriteFrontier, frames, tracks: blocks }, transfer);
+            S.workletNode.port.postMessage({ type: 'append', base: ST.jsWriteFrontier, frames, tracks: blocks }, transfer);
         } catch (_) { return false; }
-        jsWriteFrontier += frames;
+        ST.jsWriteFrontier += frames;
         return true;
     }
 
     // Await the worklet's next backpressure ('pos') message, or a short timeout.
     function waitPos() {
         return new Promise((resolve) => {
-            posWaiter = resolve;
-            setTimeout(() => { if (posWaiter === resolve) { posWaiter = null; resolve(); } }, 100);
+            ST.posWaiter = resolve;
+            setTimeout(() => { if (ST.posWaiter === resolve) { ST.posWaiter = null; resolve(); } }, 100);
         });
     }
 
@@ -1293,29 +1288,29 @@ import {
     // frontier. On the initial run, prefill then start (honouring pending play).
     async function runPump(isInitial) {
         try {
-            const prefillTo = Math.min(streamTotalSamples,
-                jsWriteFrontier + Math.ceil(STREAM_PREFILL_SEC * streamSampleRate));
-            while (!pumpStop && jsWriteFrontier < prefillTo) {
+            const prefillTo = Math.min(ST.streamTotalSamples,
+                ST.jsWriteFrontier + Math.ceil(STREAM_PREFILL_SEC * ST.streamSampleRate));
+            while (!ST.pumpStop && ST.jsWriteFrontier < prefillTo) {
                 if (!(await appendRound())) break;
             }
-            if (pumpStop) return;
+            if (ST.pumpStop) return;
             if (isInitial) {
                 S.buffersReady = true;
                 if (S.pendingPlay) { S.pendingPlay = false; transportPlay(); }
             }
-            while (!pumpStop && jsWriteFrontier < streamTotalSamples) {
-                const target = Math.min(streamTotalSamples,
-                    lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * streamSampleRate));
-                if (jsWriteFrontier >= target) { await waitPos(); continue; }
+            while (!ST.pumpStop && ST.jsWriteFrontier < ST.streamTotalSamples) {
+                const target = Math.min(ST.streamTotalSamples,
+                    ST.lastWorkletPos + Math.ceil(STREAM_AHEAD_SEC * ST.streamSampleRate));
+                if (ST.jsWriteFrontier >= target) { await waitPos(); continue; }
                 if (!(await appendRound())) break;
             }
         } catch (e) {
-            if (!pumpStop && (!e || e.name !== 'AbortError')) console.warn('[stems] stream pump error:', e);
+            if (!ST.pumpStop && (!e || e.name !== 'AbortError')) console.warn('[stems] stream pump error:', e);
         }
     }
 
     function cancelStreamReaders() {
-        for (const t of streamTracks) {
+        for (const t of ST.streamTracks) {
             try { t.reader && t.reader.cancel(); } catch (_) {}
             t.reader = null;
             t.leftover = EMPTY_BYTES;
@@ -1328,14 +1323,14 @@ import {
     // a proxy that ignores Range returns 200 from 0, so we skip the header +
     // preceding samples ourselves.
     async function openTrackStreams(fromSample, gen, token) {
-        await Promise.all(streamTracks.map(async (t) => {
+        await Promise.all(ST.streamTracks.map(async (t) => {
             // Byte offset of sample `fromSample` in this track's WAV (header +
             // linear PCM). dataOffset is the parsed header size (44 for the
             // proxy's canonical WAV, but honour a non-canonical one too).
             const byteOffset = t.dataOffset + fromSample * t.byteAlign;
             const headers = { Range: 'bytes=' + byteOffset + '-' };
             const resp = await fetch(t.url, { signal: S.abortController.signal, headers });
-            if (gen !== S.loadGeneration || token !== streamSeekToken) {
+            if (gen !== S.loadGeneration || token !== ST.streamSeekToken) {
                 try { resp.body && resp.body.cancel(); } catch (_) {}
                 return;
             }
@@ -1352,26 +1347,26 @@ import {
     // target, and resume the pump. Sample-accurate; O(1) network with a
     // 206-capable proxy, O(offset) discard otherwise.
     async function repositionStream(targetSec) {
-        const token = ++streamSeekToken;
+        const token = ++ST.streamSeekToken;
         const gen = S.loadGeneration;
-        pumpStop = true;
+        ST.pumpStop = true;
         cancelStreamReaders();
-        const Tsamp = Math.max(0, Math.round(targetSec * streamSampleRate));
+        const Tsamp = Math.max(0, Math.round(targetSec * ST.streamSampleRate));
         if (S.workletNode) {
-            try { S.workletNode.port.postMessage({ type: 'seek', offset: Tsamp / streamSampleRate }); } catch (_) {}
+            try { S.workletNode.port.postMessage({ type: 'seek', offset: Tsamp / ST.streamSampleRate }); } catch (_) {}
         }
-        jsWriteFrontier = Tsamp;
-        lastWorkletPos = Tsamp;
+        ST.jsWriteFrontier = Tsamp;
+        ST.lastWorkletPos = Tsamp;
         try {
             await openTrackStreams(Tsamp, gen, token);
         } catch (e) {
-            if (token === streamSeekToken && (!e || e.name !== 'AbortError')) {
+            if (token === ST.streamSeekToken && (!e || e.name !== 'AbortError')) {
                 console.warn('[stems] seek refetch failed:', e);
             }
             return;
         }
-        if (token !== streamSeekToken || gen !== S.loadGeneration) return;
-        pumpStop = false;
+        if (token !== ST.streamSeekToken || gen !== S.loadGeneration) return;
+        ST.pumpStop = false;
         runPump(false);
     }
 
@@ -1423,11 +1418,11 @@ import {
             // mixed-rate pack would play some stems at the wrong speed, so refuse
             // to stream (the caller falls back). Demucs output is homogeneous;
             // this is a defensive guard.
-            if (!streamSampleRate) {
-                streamSampleRate = hdr.sampleRate;
-            } else if (hdr.sampleRate !== streamSampleRate) {
+            if (!ST.streamSampleRate) {
+                ST.streamSampleRate = hdr.sampleRate;
+            } else if (hdr.sampleRate !== ST.streamSampleRate) {
                 console.warn('[stems] stem "' + t.id + '" rate ' + hdr.sampleRate
-                    + ' != ' + streamSampleRate + '; cannot stream a mixed-rate pack');
+                    + ' != ' + ST.streamSampleRate + '; cannot stream a mixed-rate pack');
                 return false;
             }
             built.push(t);
@@ -1446,23 +1441,23 @@ import {
             // mixdown can be encoded at the source rate (≠ the demucs stem rate),
             // in which case it'd play at the wrong speed. Only keep it when its
             // rate matches; otherwise drop it and play the separated stems.
-            if (hdr && hdr.sampleRate === streamSampleRate) {
+            if (hdr && hdr.sampleRate === ST.streamSampleRate) {
                 t.nch = hdr.nch; t.byteAlign = hdr.nch * 2; t.dataOffset = hdr.dataOffset;
                 t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
                 fullTrack = t;
             } else {
                 if (hdr) console.warn('[stems] original_audio rate '
-                    + hdr.sampleRate + ' != ' + streamSampleRate + '; using separated stems only');
+                    + hdr.sampleRate + ' != ' + ST.streamSampleRate + '; using separated stems only');
                 try { t.reader.cancel(); } catch (_) {}
             }
         }
 
         const maxStemFrames = built.reduce((m, t) => Math.max(m, t.totalFrames), 0);
         if (maxStemFrames <= 0) return false;
-        streamTotalSamples = maxStemFrames;
+        ST.streamTotalSamples = maxStemFrames;
 
         // 2. Pin the AudioContext to the source rate + (re)load the worklet.
-        const okCtx = await ensureCtxAtRate(streamSampleRate);
+        const okCtx = await ensureCtxAtRate(ST.streamSampleRate);
         if (gen !== S.loadGeneration) return false;
         if (!okCtx || !S.audioCtx) {
             console.warn('[stems] could not run the AudioContext at the stem sample rate; not streaming');
@@ -1474,16 +1469,16 @@ import {
         //    it when its length matches the stems, clamped so it can't extend the
         //    song past where the stems / highway end.
         S.fullTrackIndex = -1;
-        streamTracks = built.slice();
+        ST.streamTracks = built.slice();
         if (fullTrack) {
-            const tol = Math.max(2048, Math.round(0.05 * streamSampleRate));
+            const tol = Math.max(2048, Math.round(0.05 * ST.streamSampleRate));
             if (Math.abs(fullTrack.totalFrames - maxStemFrames) > tol) {
                 console.warn('[stems] original_audio length off by '
                     + (fullTrack.totalFrames - maxStemFrames) + ' frames; using separated stems only.');
                 try { fullTrack.reader.cancel(); } catch (_) {}
             } else {
                 fullTrack.totalFrames = Math.min(fullTrack.totalFrames, maxStemFrames);
-                streamTracks.push(fullTrack);
+                ST.streamTracks.push(fullTrack);
                 S.fullTrackIndex = built.length;
             }
         }
@@ -1532,29 +1527,29 @@ import {
         // takeover (core was already playing stem[0]) or a seek during setup left
         // it on transport.baseOffset. Start the window there instead of 0; the
         // tracks' readers begin at PCM sample 0, so skip forward to the offset.
-        transport.duration = streamTotalSamples / streamSampleRate;
+        transport.duration = ST.streamTotalSamples / ST.streamSampleRate;
         const initialOffsetSamples = Math.max(0, Math.min(
-            Math.round((transport.baseOffset || 0) * streamSampleRate), streamTotalSamples));
-        transport.baseOffset = initialOffsetSamples / streamSampleRate;
+            Math.round((transport.baseOffset || 0) * ST.streamSampleRate), ST.streamTotalSamples));
+        transport.baseOffset = initialOffsetSamples / ST.streamSampleRate;
         transport.baseCtxTime = 0;
         transport.playing = false;
         const core = document.getElementById('audio');
         const coreRate = core ? Number(core.playbackRate) : 1;
         transport.rate = (Number.isFinite(coreRate) && coreRate > 0) ? coreRate : 1;
-        jsWriteFrontier = initialOffsetSamples;
-        lastWorkletPos = initialOffsetSamples;
+        ST.jsWriteFrontier = initialOffsetSamples;
+        ST.lastWorkletPos = initialOffsetSamples;
         if (initialOffsetSamples > 0) {
-            for (const t of streamTracks) t.skipBytes = initialOffsetSamples * t.byteAlign;
+            for (const t of ST.streamTracks) t.skipBytes = initialOffsetSamples * t.byteAlign;
         }
 
         const { stemGains, fullGain } = computeMixGains(S.stemState, S.fullTrackIndex >= 0);
         const gains = stemGains.slice();
         if (S.fullTrackIndex >= 0) gains.push(fullGain);
-        const openTracks = streamTracks.map((t) => ({ nch: t.nch, length: t.totalFrames }));
+        const openTracks = ST.streamTracks.map((t) => ({ nch: t.nch, length: t.totalFrames }));
         try {
             S.workletNode.port.postMessage({
                 type: 'open', tracks: openTracks, gains,
-                sampleRate: streamSampleRate, cap: Math.ceil(STREAM_CAP_SEC * streamSampleRate),
+                sampleRate: ST.streamSampleRate, cap: Math.ceil(STREAM_CAP_SEC * ST.streamSampleRate),
                 startSample: initialOffsetSamples,
             });
         } catch (e) {
@@ -1564,23 +1559,23 @@ import {
         S.workletPostReady = true;
         updateLatencyOffset();
 
-        pumpStop = false; // teardown() set this true; clear it before pumping
-        streaming = true;
+        ST.pumpStop = false; // teardown() set this true; clear it before pumping
+        ST.streaming = true;
         runPump(true); // async — prefills, then starts on pending play
         return true;
     }
 
     function resetStreamState() {
-        pumpStop = true;
-        streamSeekToken++;
+        ST.pumpStop = true;
+        ST.streamSeekToken++;
         cancelStreamReaders();
-        streamTracks = [];
-        streaming = false;
-        streamSampleRate = 0;
-        streamTotalSamples = 0;
-        jsWriteFrontier = 0;
-        lastWorkletPos = 0;
-        if (posWaiter) { const r = posWaiter; posWaiter = null; try { r(); } catch (_) {} }
+        ST.streamTracks = [];
+        ST.streaming = false;
+        ST.streamSampleRate = 0;
+        ST.streamTotalSamples = 0;
+        ST.jsWriteFrontier = 0;
+        ST.lastWorkletPos = 0;
+        if (ST.posWaiter) { const r = ST.posWaiter; ST.posWaiter = null; try { r(); } catch (_) {} }
     }
 
     // ── Song-fader bridge ──

@@ -65,3 +65,18 @@ export const SH = {
     coreNativePlay: null,
     coreNativePause: null,
 };
+
+// Streaming-path state (reassigned scalars → container, same reason as S). The
+// bounded-window streaming pump feeds the worklet ahead of its read frontier;
+// these track that path. Read across transport + onWorkletMessage + onSongReady.
+export const ST = {
+    streaming: false,          // this song is using the streaming path
+    streamTracks: [],          // [{ url, nch, byteAlign, totalFrames, reader, leftover, done, skipBytes }]
+    streamSampleRate: 0,
+    streamTotalSamples: 0,     // transport length in samples (max stem)
+    jsWriteFrontier: 0,        // next absolute sample the pump will append
+    pumpStop: false,
+    lastWorkletPos: 0,         // worklet read frontier (samples), via 'pos'
+    posWaiter: null,           // resolve fn for a pump await on next 'pos'
+    streamSeekToken: 0,        // invalidates a superseded seek refetch
+};
