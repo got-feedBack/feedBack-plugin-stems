@@ -1,5 +1,6 @@
 import { computeMixGains } from './mix-gains.js';
 import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
+import { clampVolume, coerceBool, hashString, isGuitarStemId } from './util.js';
 import {
     karaokeDefault, setKaraokeDefault,
     loadDefaultMuted, saveDefaultMuted,
@@ -127,12 +128,6 @@ import {
             lbl.appendChild(document.createTextNode(' ' + id));
             defMutedHost.appendChild(lbl);
         }
-    }
-
-    function clampVolume(volume) {
-        const numeric = Number(volume);
-        if (!Number.isFinite(numeric)) return null;
-        return Math.max(0, Math.min(1, numeric));
     }
 
     // Song-level gain (0..1) from the core audio mixer / persisted volume.
@@ -742,16 +737,6 @@ import {
     }
     function hideOverlay() {
         if (S.overlayEl) { S.overlayEl.remove(); S.overlayEl = null; }
-    }
-
-    function hashString(value) {
-        const text = String(value || '');
-        let hash = 2166136261;
-        for (let i = 0; i < text.length; i++) {
-            hash ^= text.charCodeAt(i);
-            hash = Math.imul(hash, 16777619);
-        }
-        return (hash >>> 0).toString(36);
     }
 
     function storageSongKey() {
@@ -2059,13 +2044,6 @@ import {
         };
     }
 
-    // Coerce common non-boolean inputs ('false', '0', 0, '', null) to false
-    // so external callers can't accidentally mute by passing a string.
-    function coerceBool(v) {
-        if (v === 'false' || v === '0' || v === '' || v == null) return false;
-        return Boolean(v);
-    }
-
     function capabilityApi() {
         return window.slopsmith && window.slopsmith.capabilities;
     }
@@ -2159,10 +2137,6 @@ import {
             }
         }
         registeredMixParticipantIds.clear();
-    }
-
-    function isGuitarStemId(id) {
-        return /(^|[-_\s])(guitars?|rhythm|lead|dist|distortion)([-_\s]|$)/i.test(String(id || ''));
     }
 
     function applyStemState(stem, on, vol = stem.vol) {
