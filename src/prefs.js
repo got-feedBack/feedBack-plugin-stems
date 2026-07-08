@@ -7,7 +7,8 @@ const MUTE_KEY_PREFIX = 'stemsMute:';  // per-song muted stem ids
 const VOL_KEY_PREFIX = 'stemsVol:';    // per-song volume overrides (id -> 0..1)
 
 export function karaokeDefault() {
-    return localStorage.getItem(KARAOKE_KEY) === '1';
+    try { return localStorage.getItem(KARAOKE_KEY) === '1'; }
+    catch (_) { return false; }
 }
 export function setKaraokeDefault(on) {
     try { localStorage.setItem(KARAOKE_KEY, on ? '1' : '0'); } catch (_) {}
@@ -45,7 +46,10 @@ export function loadVolumes(filename) {
     if (!filename) return {};
     try {
         const raw = localStorage.getItem(VOL_KEY_PREFIX + filename);
-        return raw ? (JSON.parse(raw) || {}) : {};
+        const v = raw ? JSON.parse(raw) : {};
+        // Must be a plain object: an array/scalar would make saveVolume() stringify
+        // an array and silently drop string-keyed volume entries.
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
     } catch (_) { return {}; }
 }
 export function saveVolume(filename, id, vol) {

@@ -53,8 +53,25 @@ test('per-song volumes round-trip and merge across saves', () => {
 test('corrupt localStorage values degrade to safe defaults', () => {
     store.set('stemsDefaultMuted', '{not json');
     assert.deepEqual([...loadDefaultMuted()], []);
-    store.set('stemsVol:x', 'nope');
+    store.set('stemsVol:x', 'nope');            // invalid JSON
     assert.deepEqual(loadVolumes('x'), {});
     store.set('stemsMute:x', '"a string not array"');
     assert.equal(loadMuted('x'), null);
+});
+
+test('loadVolumes coerces valid-but-non-object JSON to {} (guards saveVolume)', () => {
+    for (const bad of ['[]', 'true', '42', '"str"', 'null']) {
+        store.set('stemsVol:s', bad);
+        assert.deepEqual(loadVolumes('s'), {}, `expected {} for ${bad}`);
+    }
+});
+
+test('karaokeDefault returns false when localStorage throws (blocked/privacy)', () => {
+    const orig = globalThis.localStorage;
+    globalThis.localStorage = { getItem: () => { throw new Error('storage blocked'); } };
+    try {
+        assert.equal(karaokeDefault(), false);
+    } finally {
+        globalThis.localStorage = orig;
+    }
 });
