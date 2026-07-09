@@ -2,6 +2,7 @@ import { computeMixGains } from './mix-gains.js';
 import { clampVolume, coerceBool, hashString, isGuitarStemId } from './util.js';
 import { ensureCtx, ensureWorklet, updateLatencyOffset } from './audio-ctx.js';
 import { makeStemGainHandle } from './mix.js';
+import { publishAudioGraph, retractAudioGraph } from './audio-graph-publish.js';
 import {
     setupStreaming, resetStreamState, streamingSupported, isWavResponse, configureStreaming,
 } from './streaming.js';
@@ -259,6 +260,7 @@ import {
             S.analyserNode = null;
         }
         if (S.masterGain) {
+            retractAudioGraph();
             try { S.masterGain.disconnect(); } catch (_) {}
             S.masterGain = null;
         }
@@ -564,6 +566,7 @@ import {
         S.analyserNode = S.audioCtx.createAnalyser();
         S.analyserNode.fftSize = 256;
         S.masterGain.connect(S.analyserNode);
+        publishAudioGraph();
 
         // In worklet mode the single 'stem-mixer' node replaces every per-stem
         // AudioBufferSourceNode + GainNode and feeds S.masterGain directly. It has

@@ -13,6 +13,7 @@
 import { S, ST, transport } from './state.js';
 import { ensureCtxAtRate, updateLatencyOffset } from './audio-ctx.js';
 import { makeStemGainHandle } from './mix.js';
+import { publishAudioGraph } from './audio-graph-publish.js';
 import { computeMixGains } from './mix-gains.js';
 import { clampVolume } from './util.js';
 import { parseWavHeader, pcm16ToFloat32 } from './wav-pcm.js';
@@ -400,6 +401,7 @@ export async function setupStreaming(stems, probeResp, fullUrl, gen) {
     S.analyserNode = S.audioCtx.createAnalyser();
     S.analyserNode.fftSize = 256;
     S.masterGain.connect(S.analyserNode);
+    publishAudioGraph();
     S.workletPostReady = false;
     try {
         S.workletNode = new AudioWorkletNode(S.audioCtx, 'stem-mixer', {
