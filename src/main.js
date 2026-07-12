@@ -1012,6 +1012,12 @@ import {
         // silently whenever the bus wasn't up yet.)
         const wireLifecycleListeners = () => {
             if (!(window.slopsmith && typeof window.slopsmith.on === 'function')) {
+                // `feedBack:capabilities:ready` is what capabilities.js actually dispatches
+                // (capabilities.js:1536). The slopsmith: name is the PRE-DMCA event and nothing
+                // emits it any more — so this fallback has been DEAD since the rename, and the
+                // lifecycle listeners silently never wired when the bus was late. Keep the old
+                // alias too, harmlessly, for an older capabilities build.
+                window.addEventListener('feedBack:capabilities:ready', wireLifecycleListeners, { once: true });
                 window.addEventListener('slopsmith:capabilities:ready', wireLifecycleListeners, { once: true });
                 return;
             }
@@ -1028,14 +1034,70 @@ import {
         };
         wireLifecycleListeners();
 
-        // Clean up on leaving the player
-        const _show = window.showScreen;
-        hookState.baseShowScreen = _show;
-        window.showScreen = function (id) {
-            const impl = hookState.impl;
-            if (id !== 'player' && impl && typeof impl.teardown === 'function') impl.teardown();
-            return hookState.baseShowScreen.call(this, id);
+        // Clean up on leaving the player.
+        //
+        // This USED to monkey-patch window.showScreen. It doesn't any more, and that mattered:
+        // THREE parties were wrapping that one global — core publishes it, the v3 shell wrapped it
+        // (carrying the legacy home -> v3-songs mapping), and this wrapped it again — each
+        // capturing whatever happened to be there at the time. Plugins load ASYNCHRONOUSLY, so the
+        // chain linked up in whatever order the race settled, and when this wrapper won, the
+        // shell's mapping was silently dropped and the LIBRARY OPENED ON THE DEAD LEGACY SCREEN.
+        // Testers saw it as "randomly, the library shows the old interface"
+        // (got-feedback/feedback#923, #924).
+        //
+        // Core already emits screen:changed for exactly this. Listening costs nothing, cannot
+        // clobber another plugin, and cannot be clobbered by one.
+        //
+        // RETRY IF THE BUS IS LATE. Codex [P2] on the first cut, and it was right: the old
+        // wrapper did not need window.feedBack to exist, but a listener does. Bailing out when
+        // the bus is not ready yet would silently mean teardown() NEVER runs — a leak that only
+        // shows up as stems still playing after you leave the player. Same shape, and the same
+        // fix, as wireLifecycleListeners() above.
+        // screen:CHANGING, not screen:changed. Codex [P2], and it matters: the old wrapper ran
+        // BEFORE showScreen did anything, whereas screen:changed fires at the very END — after
+        // core awaits library and provider loads. Listening to the late event would delay teardown
+        // behind a slow fetch, or skip it entirely if that fetch threw, and the stems graph would
+        // keep playing on a non-player screen. screen:changing fires before any of that, which is
+        // exactly the timing the wrapper had.
+        const wireScreenListener = () => {
+            // Either bus. `window.slopsmith` is the LEGACY ALIAS of the same object
+            // (core's app.js: `window.slopsmith = window.feedBack`), and the rest of this file
+            // reads it. Codex [P2]: on a build that only exposes the old name, reading just
+            // `window.feedBack` would attach nothing — and with the showScreen wrapper gone,
+            // teardown() would silently never run and stems would keep playing after you leave
+            // the player. They are the same object; take whichever is there.
+            const bus = window.feedBack || window.slopsmith;
+            if (!(bus && typeof bus.on === 'function')) {
+                window.addEventListener('feedBack:capabilities:ready', wireScreenListener, { once: true });
+                window.addEventListener('slopsmith:capabilities:ready', wireScreenListener, { once: true });
+                return;
+            }
+            // BOTH events, deliberately. Codex [P2], and it is a cross-repo ordering problem:
+            //
+            //   screen:changing  fires BEFORE core navigates — the timing the old wrapper had, and
+            //                    the one we want. But it is NEW: today's released host does not
+            //                    emit it yet (got-feedback/feedback#924).
+            //   screen:changed   fires at the END of showScreen. Later than ideal, but it exists
+            //                    on every host in the field TODAY.
+            //
+            // Listening to only the new one would mean teardown() NEVER runs on the current host —
+            // the stems graph would just keep playing after you leave the player. Listening to only
+            // the old one reintroduces the late-teardown problem once the host is updated.
+            //
+            // Both is safe: the wrapper this replaces called teardown() on EVERY non-player
+            // navigation, so it is already idempotent by construction. On a new host teardown runs
+            // at the early (correct) moment and the late event is a cheap no-op; on an old host the
+            // late event is the only one, exactly as before.
+            const onLeavingPlayer = (ev) => {
+                const id = ev && ev.detail && ev.detail.id;
+                if (!id || id === 'player') return;
+                const impl = hookState.impl;
+                if (impl && typeof impl.teardown === 'function') impl.teardown();
+            };
+            bus.on('screen:changing', onLeavingPlayer);   // preferred — pre-navigation
+            bus.on('screen:changed', onLeavingPlayer);    // fallback — hosts without the new event
         };
+        wireScreenListener();
     }
 
     function capabilityApi() {
@@ -1275,6 +1337,8 @@ import {
     function installCapabilityParticipant() {
         const api = capabilityApi();
         if (!api || typeof api.registerParticipant !== 'function') {
+            // Same dead-event bug as above — see the note at wireLifecycleListeners.
+            window.addEventListener('feedBack:capabilities:ready', installCapabilityParticipant, { once: true });
             window.addEventListener('slopsmith:capabilities:ready', installCapabilityParticipant, { once: true });
             return;
         }
