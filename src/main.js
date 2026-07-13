@@ -76,11 +76,13 @@ import {
     // to today's AudioBufferSourceNode-per-stem path (speed couples pitch).
                                        // 0 = unknown → no compensation until the
                                        // worklet's 'ready' message reports it.
-    // Pristine full-mix track (feedBack#580 / core #583). When a sloppak ships
-    // a pre-separation `original_audio` mixdown, we load it as one extra worklet
-    // track and play IT instead of the lossy demucs recombination whenever every
-    // stem is on at 100% ("unity"); the moment any stem is muted/attenuated we
-    // cross to the separated stems. Worklet path only; -1 = no full-mix track.
+    // Pristine full-mix track (feedBack#580 / core #583, #933). When a pack ships
+    // its pre-separation mixdown — the RESERVED `full` stem (spec §5.3), which
+    // core surfaces separately from `stems` because it is a mixdown, not a layer
+    // — we load it as one extra worklet track and play IT instead of the lossy
+    // demucs recombination whenever every stem is on at 100% ("unity"); the
+    // moment any stem is muted/attenuated we cross to the separated stems.
+    // Worklet path only; -1 = no full-mix track.
 
     // Mix routing (applyMixRouting + the per-stem gain handle) → src/mix.js;
     // computeMixGains (pure) → src/mix-gains.js. Both imported above.
@@ -657,7 +659,7 @@ import {
             // Append the pristine full mix as one extra track (index after the
             // real stems), so unity playback uses it instead of the lossy
             // recombination — but ONLY when its length matches the stems within
-            // tolerance. original_audio is a SEPARATE encode (codec priming can
+            // tolerance. The full mix is a SEPARATE encode (codec priming can
             // shift it slightly); the transport/highway timeline tracks the
             // stems, and the worklet ends at its longest track, so a longer mix
             // would play past the song end and a shorter/wrong one would drop to
@@ -672,7 +674,7 @@ import {
             if (fullBuffer) {
                 const tol = Math.max(2048, Math.round(0.05 * (S.audioCtx ? S.audioCtx.sampleRate : 48000)));
                 if (Math.abs(fullBuffer.length - stemMaxLen) > tol) {
-                    console.warn('[stems] original_audio length off by '
+                    console.warn('[stems] full mix length off by '
                         + (fullBuffer.length - stemMaxLen) + ' samples (> ' + tol
                         + '); ignoring it, using separated stems only.');
                 } else {
@@ -801,11 +803,20 @@ import {
         const gen = S.loadGeneration;
         S.abortController = new AbortController();
 
-        // Pristine full-mix mixdown, if the pack ships one (core #583 exposes
-        // it on song_info). Worklet path only — it rides the same time-stretch
-        // graph as an extra track. A failed/absent full mix degrades silently to
-        // separated-stems playback (loadFullMix returns null).
-        const fullUrl = (S.useWorklet && info && info.has_original_audio) ? info.original_audio_url : null;
+        // Pristine full-mix mixdown, if the pack ships one. This is the RESERVED
+        // `full` stem (feedpak §5.3), which core lifts out of `info.stems` and
+        // surfaces separately — it is a mixdown, not a layer, so it must never be
+        // one of the tracks we sum. Worklet path only: it rides the same
+        // time-stretch graph as an extra track. A failed/absent full mix degrades
+        // silently to separated-stems playback (loadFullMix returns null).
+        //
+        // `has_original_audio` / `original_audio_url` are the DEPRECATED aliases
+        // of these two fields, named after a manifest key core invented and the
+        // spec never had (#933). Kept as a fallback so this plugin still works
+        // against a core that predates the rename; drop with the aliases.
+        const hasFullMix = !!(info && (info.has_full_mix || info.has_original_audio));
+        const fullMixUrl = info && (info.full_mix_url || info.original_audio_url);
+        const fullUrl = (S.useWorklet && hasFullMix) ? fullMixUrl : null;
 
         // Probe stem[0] to choose the path by Content-Type: the iOS proxy serves
         // `audio/wav` (raw PCM — streamable, bounded memory); desktop serves

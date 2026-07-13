@@ -357,7 +357,7 @@ export async function setupStreaming(stems, probeResp, fullUrl, gen) {
             t.totalFrames = Math.floor(hdr.dataSize / t.byteAlign);
             fullTrack = t;
         } else {
-            if (hdr) console.warn('[stems] original_audio rate '
+            if (hdr) console.warn('[stems] full mix rate '
                 + hdr.sampleRate + ' != ' + ST.streamSampleRate + '; using separated stems only');
             try { t.reader.cancel(); } catch (_) {}
         }
@@ -384,7 +384,7 @@ export async function setupStreaming(stems, probeResp, fullUrl, gen) {
     if (fullTrack) {
         const tol = Math.max(2048, Math.round(0.05 * ST.streamSampleRate));
         if (Math.abs(fullTrack.totalFrames - maxStemFrames) > tol) {
-            console.warn('[stems] original_audio length off by '
+            console.warn('[stems] full mix length off by '
                 + (fullTrack.totalFrames - maxStemFrames) + ' frames; using separated stems only.');
             try { fullTrack.reader.cancel(); } catch (_) {}
         } else {
