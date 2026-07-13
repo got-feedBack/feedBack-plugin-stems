@@ -6,6 +6,18 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Changed
 
+- **The full mix is a stem** (feedback#933). The pristine mixdown we play while
+  every fader sits at unity now arrives on `song_info` as `full_mix_url` /
+  `has_full_mix`. It used to arrive as `original_audio_url` — named after a
+  manifest key core invented and the feedpak spec never had. The mixdown is a
+  stem: feedpak 1.15.0 RESERVES the id `full` for it, and core reads it from
+  there. Core still lifts it OUT of `info.stems` before sending, which is what
+  keeps this plugin correct — `full` already contains every instrument, so if it
+  ever appeared among the tracks we sum, unity playback would double the whole
+  song and muting "guitar" would leave guitar audible inside the mix. The old
+  names are read as a fallback so the plugin still works against a core that
+  predates the rename; that fallback goes when the aliases do (feedback#945).
+
 - **ES-module migration, step 11.1 — streaming/transport hardening.** (1) Guard
   `handleNaturalEnd()` on `transport.playing`: in worklet mode a queued `ended`
   message could arrive just after a user pause/stop flipped `playing=false` and
