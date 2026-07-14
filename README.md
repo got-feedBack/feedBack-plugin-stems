@@ -1,6 +1,6 @@
 # Slopsmith Plugin: Stems Toggle
 
-A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that turns multi-stem `.sloppak` songs into a live mixing board. Toggle guitar, bass, drums, vocals, piano, or "other" on the fly during playback, tweak each stem's volume, and the plugin remembers your mix per song.
+A plugin for [Slopsmith](https://github.com/got-feedback/feedBack) that turns multi-stem `.sloppak` songs into a live mixing board. Toggle guitar, bass, drums, vocals, piano, or "other" on the fly during playback, tweak each stem's volume, and the plugin remembers your mix per song.
 
 archive songs are untouched — the plugin only activates when a song's `song_info` payload contains a non-empty `stems[]` array.
 
