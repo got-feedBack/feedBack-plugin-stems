@@ -757,7 +757,7 @@ import {
     // ── Main entry: called after song_info arrives ──
     async function onSongReady() {
         teardown();
-        const info = highway.getSongInfo && highway.getSongInfo();
+        const info = currentSongInfo();
         const stems = (info && info.stems) || [];
         if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0 }); return; } // archive or stem-less sloppak — do nothing
 
@@ -936,8 +936,60 @@ import {
         };
     }
 
+    // The stem list, from the highway if it has arrived — otherwise from the
+    // preload (see preloadSong). Both carry the same {id,url,default} triples;
+    // core builds them from one shared helper precisely so these cannot drift,
+    // which is what lets the signature below match and the ready path skip a
+    // second, identical build.
+    function currentSongInfo() {
+        const live = highway.getSongInfo && highway.getSongInfo();
+        if (live && Array.isArray(live.stems) && live.stems.length) return live;
+        const pre = S.preloadInfo;
+        if (pre && pre.filename && pre.filename === S.currentFilename) return pre;
+        return live || null;
+    }
+
+    // Start the whole load — fetch, decode, and the graph build — as soon as the
+    // song starts loading, instead of waiting for the highway's WS `ready`.
+    //
+    // The graph build hands every stem's decoded PCM to the audio worklet, which
+    // means copying the entire song: for a 4-minute 6-stem pack that is over half
+    // a GIGABYTE of memcpy, and it runs in one frame on the main thread. Done at
+    // `ready` — with the player already on screen — it froze the picture for
+    // ~700ms: the venue video visibly stopped. Measured on a real load: a 698ms
+    // frame, right as the song-credits card appeared.
+    //
+    // Nothing about the work changes; only WHEN. Here it lands behind the loading
+    // overlay, before the highway (and the venue) is drawn, where a stalled frame
+    // costs nothing.
+    //
+    // Best-effort: any failure just leaves the old `ready`-driven path to do it.
+    async function preloadSong(filename) {
+        if (!filename) return;
+        const gen = ++S.preloadGen;
+        let info = null;
+        try {
+            const res = await fetch('/api/song/' + encodeURIComponent(filename) + '?stems=1');
+            if (!res.ok) return;
+            const d = await res.json();
+            if (!Array.isArray(d.stems) || d.stems.length === 0) return;
+            info = {
+                filename,
+                stems: d.stems,
+                full_mix_url: d.full_mix_url || null,
+                has_full_mix: !!d.full_mix_url,
+            };
+        } catch (_) {
+            return;   // offline / older core without ?stems=1 → ready path handles it
+        }
+        // A newer song (or a teardown) started while we were fetching.
+        if (gen !== S.preloadGen || filename !== S.currentFilename) return;
+        S.preloadInfo = info;
+        tryInitForCurrentSong();
+    }
+
     function tryInitForCurrentSong() {
-        const info = highway.getSongInfo && highway.getSongInfo();
+        const info = currentSongInfo();
         if (!info || !Array.isArray(info.stems)) return false;
         const signature = songInfoSignature(info);
         if (signature === S.readySignature) return true;
@@ -971,6 +1023,10 @@ import {
                 teardown();
                 S.currentSongKey = ref.songKey;
                 S.currentFilename = ref.filename || S.currentFilename || null;
+                // Get the whole load underway NOW — before the highway (and the
+                // venue) is on screen. See preloadSong for why that matters.
+                S.preloadInfo = null;
+                preloadSong(S.currentFilename);
             },
             onPlaybackReady(detail = {}) {
                 // A `ready` alias (playback:ready / song:loaded / song:ready)

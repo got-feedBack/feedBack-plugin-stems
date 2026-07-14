@@ -34,6 +34,12 @@ export const S = {
     currentSongKey: null,
     pollHandle: null,
     readySignature: null,
+    // Stem list fetched at `song:loading` from /api/song/{f}?stems=1, so the
+    // load (and the whole-song PCM copy it ends with) can run before the highway
+    // is drawn. Generation-counted: a newer song must not be overtaken by an
+    // in-flight preload for the previous one. See preloadSong.
+    preloadInfo: null,
+    preloadGen: 0,
     sloppakActive: false,           // true while a sloppak owns #audio transport
     buffersReady: false,            // true once all stems are decoded + graphed
     pendingPlay: false,             // a play() arrived before buffers were ready
