@@ -773,7 +773,11 @@ import {
         teardown();
         const info = currentSongInfo();
         const stems = (info && info.stems) || [];
-        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0 }); return; } // archive or stem-less sloppak — do nothing
+        // Archive or stem-less sloppak — no graph to build, but keep the event
+        // shape identical to the stem-bearing path (stemIds/stems present and
+        // empty) so a listener can tell "0 stems" from "old plugin without
+        // these fields".
+        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0, stemIds: [], stems: [] }); return; }
 
         ensureCtx();
         // Decide per-song whether the pitch-preserving worklet is available.
