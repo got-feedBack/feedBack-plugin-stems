@@ -486,13 +486,26 @@ import {
     }
 
     // Fetch + decode every stem concurrently. Returns one entry per stem
-    // ({ id, url, default, buffer }; buffer is null on failure), or null if
-    // the load was superseded by a newer song (generation mismatch).
+    // ({ id, url, default, name, description, buffer }; buffer is null on
+    // failure, name/description are the manifest's optional presentational
+    // fields — feedpak §5.3 — and undefined when the pack or core predates
+    // them), or null if the load was superseded by a newer song (generation
+    // mismatch).
+    // Normalize an optional presentational field once, at the boundary: a
+    // non-blank string passes through, everything else (missing, empty,
+    // non-string — a core we don't control) becomes undefined, so stemState /
+    // getState() / the provider-ready payload all expose `string | undefined`.
+    function presentationalString(v) {
+        return (typeof v === 'string' && v.trim()) ? v : undefined;
+    }
+
     async function loadStems(stems, gen, signal) {
         let completed = 0;
         showOverlay(completed, stems.length);
 
         const out = await Promise.all(stems.map(async (s) => {
+            const name = presentationalString(s.name);
+            const description = presentationalString(s.description);
             try {
                 const resp = await fetch(s.url, { signal });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -500,11 +513,11 @@ import {
                 if (gen !== S.loadGeneration) return null;
                 const buffer = await decodeAudioData(arrayBuf);
                 if (gen !== S.loadGeneration) return null;
-                return { id: s.id, url: s.url, default: !!s.default, buffer };
+                return { id: s.id, url: s.url, default: !!s.default, name, description, buffer };
             } catch (err) {
                 if (gen !== S.loadGeneration) return null;
                 console.error('[stems] failed to load stem "' + s.id + '":', err);
-                return { id: s.id, url: s.url, default: !!s.default, buffer: null };
+                return { id: s.id, url: s.url, default: !!s.default, name, description, buffer: null };
             } finally {
                 // Count every finished attempt — success OR failure — so the
                 // overlay progress can't stall at e.g. 5/6 on a failed stem.
@@ -624,6 +637,7 @@ import {
             if (r.buffer.duration > maxDur) maxDur = r.buffer.duration;
             return {
                 id: r.id, url: r.url, default: r.default, buffer: r.buffer,
+                name: r.name, description: r.description,
                 source: null, gain, on, vol: initialVol,
             };
         });
@@ -759,7 +773,11 @@ import {
         teardown();
         const info = currentSongInfo();
         const stems = (info && info.stems) || [];
-        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0 }); return; } // archive or stem-less sloppak — do nothing
+        // Archive or stem-less sloppak — no graph to build, but keep the event
+        // shape identical to the stem-bearing path (stemIds/stems present and
+        // empty) so a listener can tell "0 stems" from "old plugin without
+        // these fields".
+        if (stems.length === 0) { emitStemsState('provider-ready', { stemCount: 0, stemIds: [], stems: [] }); return; }
 
         ensureCtx();
         // Decide per-song whether the pitch-preserving worklet is available.
@@ -905,7 +923,7 @@ import {
         injectUI();
         installSongFaderBridge();
         S.buffersReady = true;
-        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id) });
+        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id), stems: stemsMetaPayload() });
 
         if (S.pendingPlay) { S.pendingPlay = false; transportPlay(); }
     }
@@ -1270,6 +1288,20 @@ import {
         registerStemOwnerStatus('available');
     }
 
+    // Per-stem display metadata for provider-ready listeners (e.g. stem_mixer):
+    // id always, plus the manifest's optional `name`/`description` (feedpak
+    // §5.3) when present — already normalized to `string | undefined` at load
+    // (presentationalString). Kept separate from `stemIds`, which stays a
+    // plain string array for existing consumers.
+    function stemsMetaPayload() {
+        return S.stemState.map(s => {
+            const entry = { id: s.id };
+            if (s.name) entry.name = s.name;
+            if (s.description) entry.description = s.description;
+            return entry;
+        });
+    }
+
     function emitStemsState(event, payload = {}) {
         const detail = { event, ...redactedSongRef(), ...payload };
         try { window.dispatchEvent(new CustomEvent('stems:state', { detail })); } catch (_) {}
@@ -1460,14 +1492,17 @@ import {
         });
         registerStemMixParticipants();
         registerStemOwnerStatus(S.stemState.length ? 'available' : 'unavailable');
-        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id) });
+        emitStemsState('provider-ready', { stemCount: S.stemState.length, stemIds: S.stemState.map(s => s.id), stems: stemsMetaPayload() });
     }
 
     /**
      * Public API exposed at window.stems for other plugins (e.g. stem_mixer).
      *
-     *   getState()           Returns [{id, vol, on, gain, audio}, ...] for the
-     *                        current song's stems. Callers may mutate
+     *   getState()           Returns [{id, name, description, vol, on, gain,
+     *                        audio}, ...] for the current song's stems.
+     *                        `name`/`description` are the manifest's optional
+     *                        presentational fields (feedpak §5.3) — undefined
+     *                        when the pack or core predates them. Callers may mutate
      *                        gain.gain.value directly to set a stem's level,
      *                        but should re-fetch on every song:loaded because
      *                        gains are recreated between songs. In legacy
@@ -1487,7 +1522,8 @@ import {
      */
     const stemsApi = {
         getState: () => S.stemState.map(s => ({
-            id: s.id, vol: s.vol, on: s.on, gain: s.gain, audio: null,
+            id: s.id, name: s.name, description: s.description,
+            vol: s.vol, on: s.on, gain: s.gain, audio: null,
         })),
         setVolume(id, vol) {
             const v = Number(vol);

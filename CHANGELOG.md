@@ -4,6 +4,22 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] — Per-stem display metadata (name/description)
+
+### Added
+
+- **Forward per-stem `name`/`description`** (feedpak 1.16.0, spec §5.3). A core
+  that passes the manifest's optional presentational fields through `song_info`
+  stems (feedback#1013) gets them carried from load to state, so consumers can
+  display them: the `stems:state` provider-ready event gains a `stems: [{id,
+  name?, description?}]` array (alongside `stemIds`, which stays a plain string
+  array for existing listeners), and `window.stems.getState()` rows gain
+  `name`/`description`. Against an older core the fields are simply undefined
+  and nothing changes. Normalized once at load (`presentationalString`):
+  non-blank strings pass, everything else becomes undefined, so `getState()`
+  and the event payload agree. Purely additive — this plugin's own chip UI
+  still renders ids; display work lands in stem_mixer.
+
 ### Changed
 
 - **The full mix is a stem** (feedback#933). The pristine mixdown we play while
