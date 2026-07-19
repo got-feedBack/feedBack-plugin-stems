@@ -491,11 +491,21 @@ import {
     // fields — feedpak §5.3 — and undefined when the pack or core predates
     // them), or null if the load was superseded by a newer song (generation
     // mismatch).
+    // Normalize an optional presentational field once, at the boundary: a
+    // non-blank string passes through, everything else (missing, empty,
+    // non-string — a core we don't control) becomes undefined, so stemState /
+    // getState() / the provider-ready payload all expose `string | undefined`.
+    function presentationalString(v) {
+        return (typeof v === 'string' && v.trim()) ? v : undefined;
+    }
+
     async function loadStems(stems, gen, signal) {
         let completed = 0;
         showOverlay(completed, stems.length);
 
         const out = await Promise.all(stems.map(async (s) => {
+            const name = presentationalString(s.name);
+            const description = presentationalString(s.description);
             try {
                 const resp = await fetch(s.url, { signal });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -503,11 +513,11 @@ import {
                 if (gen !== S.loadGeneration) return null;
                 const buffer = await decodeAudioData(arrayBuf);
                 if (gen !== S.loadGeneration) return null;
-                return { id: s.id, url: s.url, default: !!s.default, name: s.name, description: s.description, buffer };
+                return { id: s.id, url: s.url, default: !!s.default, name, description, buffer };
             } catch (err) {
                 if (gen !== S.loadGeneration) return null;
                 console.error('[stems] failed to load stem "' + s.id + '":', err);
-                return { id: s.id, url: s.url, default: !!s.default, name: s.name, description: s.description, buffer: null };
+                return { id: s.id, url: s.url, default: !!s.default, name, description, buffer: null };
             } finally {
                 // Count every finished attempt — success OR failure — so the
                 // overlay progress can't stall at e.g. 5/6 on a failed stem.
@@ -1276,13 +1286,14 @@ import {
 
     // Per-stem display metadata for provider-ready listeners (e.g. stem_mixer):
     // id always, plus the manifest's optional `name`/`description` (feedpak
-    // §5.3) when present. Kept separate from `stemIds`, which stays a plain
-    // string array for existing consumers.
+    // §5.3) when present — already normalized to `string | undefined` at load
+    // (presentationalString). Kept separate from `stemIds`, which stays a
+    // plain string array for existing consumers.
     function stemsMetaPayload() {
         return S.stemState.map(s => {
             const entry = { id: s.id };
-            if (typeof s.name === 'string' && s.name) entry.name = s.name;
-            if (typeof s.description === 'string' && s.description) entry.description = s.description;
+            if (s.name) entry.name = s.name;
+            if (s.description) entry.description = s.description;
             return entry;
         });
     }

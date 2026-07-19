@@ -6,9 +6,13 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ### Added
 
-- **Forward per-stem `name`/`description`** (feedpak 1.16.0, spec §5.3). Core now
-  passes the manifest's optional presentational fields through `song_info` stems;
-  this plugin carries them from load to state, so consumers can display them:
+- **Forward per-stem `name`/`description`** (feedpak 1.16.0, spec §5.3). A core
+  that passes the manifest's optional presentational fields through `song_info`
+  stems (feedback#1013) gets them carried from load to state, so consumers can
+  display them; against an older core the fields are simply undefined and
+  nothing changes. Normalized once at load (`presentationalString`): non-blank
+  strings pass, everything else becomes undefined, so `getState()` and the
+  event payload agree.
   the `stems:state` provider-ready event gains a `stems: [{id, name?,
   description?}]` array (alongside `stemIds`, which stays a plain string array
   for existing listeners), and `window.stems.getState()` rows gain
