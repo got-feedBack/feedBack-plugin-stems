@@ -4,6 +4,8 @@ All notable changes to the Stems Toggle plugin are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] — Per-stem display metadata (name/description)
+
 ### Added
 
 - **Forward per-stem `name`/`description`** (feedpak 1.16.0, spec §5.3). A core
