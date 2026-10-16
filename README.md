@@ -1,8 +1,8 @@
-# Slopsmith Plugin: Stems Toggle
+# feedBack Plugin: Stems Toggle
 
-A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that turns multi-stem `.sloppak` songs into a live mixing board. Toggle guitar, bass, drums, vocals, piano, or "other" on the fly during playback, tweak each stem's volume, and the plugin remembers your mix per song.
+A plugin for [feedBack](https://github.com/got-feedBack/feedBack) that turns multi-stem `.feedpak` songs into a live mixing board. Toggle guitar, bass, drums, vocals, piano, or "other" on the fly during playback, tweak each stem's volume, and the plugin remembers your mix per song.
 
-archive songs are untouched — the plugin only activates when a song's `song_info` payload contains a non-empty `stems[]` array.
+Archive songs are untouched — the plugin only activates when a song's `song_info` payload contains a non-empty `stems[]` array.
 
 ## Features
 
@@ -13,19 +13,19 @@ archive songs are untouched — the plugin only activates when a song's `song_in
 - **Karaoke mode** — one-click preset that always mutes vocals by default
 - **Sample-locked playback** — every stem plays from a decoded `AudioBuffer` through one shared `AudioContext`, so the stems and the note highway are sample-exact and cannot drift apart
 - **Pitch-preserving speed control** — slowing a song down (or speeding it up) changes tempo only, not pitch, just like archive playback
-- **Inert on archive** — core audio works normally when there are no stems to mix
+- **Inert on archive songs** — core audio works normally when there are no stems to mix
 
 ## Installation
 
 ```bash
-cd /path/to/slopsmith/plugins
-git clone https://github.com/topkoa/slopsmith-plugin-stems.git stems
+cd /path/to/feedBack/plugins
+git clone https://github.com/got-feedBack/feedBack-plugin-stems.git stems
 docker compose restart
 ```
 
 ## Usage
 
-1. Convert a archive to a `.sloppak` with the [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) plugin (which runs Demucs to split the single mixed track into per-instrument stems), or hand-craft a sloppak directory with multiple stems listed in `manifest.yaml`.
+1. Get a `.feedpak` song with more than one stem. The [Stem Splitter](https://github.com/got-feedBack/feedBack-plugin-stem-splitter) plugin splits a song's single mixed track into per-instrument stems. You can also hand-craft a feedpak with multiple stems listed in `manifest.yaml`. Legacy `.sloppak` files work the same way.
 2. Play the song. The stem mixer bar appears in `#player-controls` with one labeled button per stem.
 3. Click a stem to toggle it on/off. Drag left or right across the button to adjust its volume continuously.
 4. Your mute state and volumes are remembered the next time you open the same song.
@@ -57,7 +57,7 @@ When a song with stems loads, the plugin:
 3. Derives the playhead from the `AudioContext` clock and shims the core
    `<audio id="audio">` element's `play` / `pause` / `currentTime` / `duration`
    / `paused` to drive this transport, dispatching the matching media events so
-   the rest of slopsmith is unaffected
+   the rest of feedBack is unaffected
 4. Publishes `window.slopsmith.stems.setMasterVolume` so the core "Song" fader
    drives the master `GainNode`, moving every stem together
 5. Exposes `window.slopsmith.stems.getAnalyser()` — an `AnalyserNode` on the
@@ -67,8 +67,8 @@ Transport (play / pause / seek / speed) operates on all stems atomically:
 seeking stops and recreates every source node at the new offset so they
 restart locked. Toggling a stem is a pure `GainNode.gain.value` change.
 
-archive songs (no stems) and the JUCE desktop path are untouched — the `<audio>`
-shims delegate straight to core whenever no sloppak is active.
+Archive songs (no stems) and the JUCE desktop path are untouched — the `<audio>`
+shims delegate straight to core whenever no feedpak is active.
 
 ### Pitch-preserving speed (worklet)
 
@@ -111,7 +111,7 @@ have headless tests (`node --test`).
 
 Stems declares and registers the `stems` capability as an owner/provider. Other plugins should request stem automation through `window.slopsmith.capabilities` instead of changing Stems internals directly. The supported owner commands are `mute`, `restore`, `setVolume`, `list`, and `inspect`; `mute-guitar` and `unmute-guitar` remain compatibility aliases.
 
-The manifest uses the current capability vocabulary: Stems owns public `commands`, emits `stems.ready` and `stems.manual-unmute`, observes `claim:released` so it can clear claim snapshots, declares `playback` observer intent for song lifecycle rebuild/teardown, and declares `audio-mix` fader-provider intent for per-stem mixer controls. Stem audio remains plugin-owned, while Slopsmith's capability hosts coordinate lifecycle, automation claims, mix controls, and diagnostics.
+The manifest uses the current capability vocabulary: Stems owns public `commands`, emits `stems.ready` and `stems.manual-unmute`, observes `claim:released` so it can clear claim snapshots, declares `playback` observer intent for song lifecycle rebuild/teardown, and declares `audio-mix` fader-provider intent for per-stem mixer controls. Stem audio remains plugin-owned, while feedBack's capability hosts coordinate lifecycle, automation claims, mix controls, and diagnostics.
 
 Automation uses session-only claim snapshots. For example, NAM claims `stems` while AMP is enabled and dispatches `stems.mute` for the guitar target; Stems stores the previous on/volume state, mutes the matching stem, and restores only that claim when NAM releases it. Capability mutes are not written to per-song localStorage.
 
@@ -123,7 +123,7 @@ Current migration status:
 
 - `stems` owner/provider metadata and runtime registration are active.
 - `playback` lifecycle observation is active, so Stems rebuilds and tears down without wrapping `window.playSong`.
-- The active stem graph registers with Slopsmith's audio-session coordinator via the core Stems owner API.
+- The active stem graph registers with feedBack's audio-session coordinator via the core Stems owner API.
 - Per-stem volume controls register as native `audio-mix` fader participants.
 - Core audio synchronization uses removable event listeners instead of overwriting `core.onplay` / `core.onpause` / `core.onseeking` / `core.onratechange`.
 - Legacy `song:*` events and `window.stems` remain compatibility surfaces while downstream plugins migrate.
@@ -140,11 +140,11 @@ The intent is not to move stem playback ownership into core. Stems should contin
 
 ## Requirements
 
-Requires Slopsmith with `.sloppak` format support and a `song_info` payload that includes a `stems[]` array (available on the `feature/sloppak-format` branch and its merged descendants).
+Requires feedBack 0.3.0-alpha.1 or newer (`minHost` in `plugin.json`). The plugin needs a song whose `song_info` payload includes a non-empty `stems[]` array, which core sends for `.feedpak` (and legacy `.sloppak`) songs.
 
 ## Other Plugins
 
-- [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) — convert archives into `.sloppak` files in-app, with optional Demucs stem splitting
+- [Stem Splitter](https://github.com/got-feedBack/feedBack-plugin-stem-splitter): split `.feedpak` songs into per-instrument stems in-app, and transcribe missing lyrics
 
 ## License
 
